@@ -1,0 +1,5 @@
+telethon
+discord.py[voice]
+edge-tts
+PyNaCl
+requests
