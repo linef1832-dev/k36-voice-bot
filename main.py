@@ -177,21 +177,28 @@ async def speak_worker():
                 print("❌ ไฟล์เสียงว่าง", flush=True)
                 continue
 
-            # เล่น
-            while vc.is_playing():
-                await asyncio.sleep(0.3)
-            done = asyncio.Event()
-            perr = {}
-            def _after(err):
-                if err:
-                    perr["e"] = err
-                bot.loop.call_soon_threadsafe(done.set)
-            vc.play(discord.FFmpegPCMAudio(mp3, executable=FFMPEG_EXE), after=_after)
-            await done.wait()
-            if perr.get("e"):
-                print(f"❌ เล่นเสียงไม่ได้: {perr['e']!r}", flush=True)
-            else:
-                print("🔊 พูดสำเร็จ", flush=True)
+            # เล่นซ้ำตามจำนวนรอบ
+            repeat = int(job.get("repeat") or 1)
+            if repeat < 1:
+                repeat = 1
+            for n in range(repeat):
+                while vc.is_playing():
+                    await asyncio.sleep(0.3)
+                done = asyncio.Event()
+                perr = {}
+                def _after(err):
+                    if err:
+                        perr["e"] = err
+                    bot.loop.call_soon_threadsafe(done.set)
+                vc.play(discord.FFmpegPCMAudio(mp3, executable=FFMPEG_EXE), after=_after)
+                await done.wait()
+                if perr.get("e"):
+                    print(f"❌ เล่นเสียงไม่ได้: {perr['e']!r}", flush=True)
+                    break
+                else:
+                    print(f"🔊 พูดสำเร็จ (รอบ {n + 1}/{repeat})", flush=True)
+                if n < repeat - 1:
+                    await asyncio.sleep(0.8)  # เว้นจังหวะสั้นๆ ระหว่างรอบ
 
         except Exception as e:
             print(f"speak error: {type(e).__name__}: {e!r}", flush=True)
@@ -262,12 +269,16 @@ async def start_telegram():
             if not (kw and rooms and text):
                 continue
             if kw in raw:
-                print(f"[ตรงคำ] กะ='{sh.get('name')}' คำ='{kw}' จำนวนห้อง={len(rooms)}", flush=True)
+                repeat = int(sh.get("repeat") or 1)
+                if repeat < 1:
+                    repeat = 1
+                print(f"[ตรงคำ] กะ='{sh.get('name')}' คำ='{kw}' ห้อง={len(rooms)} รอบ={repeat}", flush=True)
                 for room in rooms:
                     await speak_queue.put({
                         "room_id": room,
                         "text": text,
                         "voice_name": sh.get("voice_name"),
+                        "repeat": repeat,
                     })
 
     print(f"✅ พร้อมฟัง {len(_tg_targets)} กลุ่ม", flush=True)
