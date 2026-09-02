@@ -21,8 +21,23 @@ import re
 import sys
 import tempfile
 
+import shutil
+
 import discord
 import edge_tts
+
+# หา ffmpeg: ใช้ของระบบก่อน ถ้าไม่มีใช้ตัวที่ฝังมากับ pip (imageio-ffmpeg)
+def _find_ffmpeg():
+    exe = shutil.which("ffmpeg")
+    if exe:
+        return exe
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return "ffmpeg"  # ปล่อยให้ discord ลองเอง
+
+FFMPEG_EXE = _find_ffmpeg()
 import requests
 from discord.ext import tasks
 from telethon import TelegramClient, events
@@ -167,7 +182,7 @@ async def speak_worker():
             while vc.is_playing():
                 await asyncio.sleep(0.3)
             done = asyncio.Event()
-            vc.play(discord.FFmpegPCMAudio(mp3),
+            vc.play(discord.FFmpegPCMAudio(mp3, executable=FFMPEG_EXE),
                     after=lambda e: bot.loop.call_soon_threadsafe(done.set))
             await done.wait()
             os.remove(mp3)
@@ -181,6 +196,7 @@ async def speak_worker():
 @bot.event
 async def on_ready():
     print(f"✅ Discord bot ล็อกอิน: {bot.user}", flush=True)
+    print(f"🎧 ใช้ ffmpeg จาก: {FFMPEG_EXE}", flush=True)
     if not getattr(bot, "_started", False):
         bot._started = True
         bot.loop.create_task(speak_worker())
