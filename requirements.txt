@@ -3,3 +3,4 @@ discord.py[voice]
 edge-tts
 PyNaCl
 requests
+imageio-ffmpeg
