@@ -38,6 +38,37 @@ def _find_ffmpeg():
         return "ffmpeg"  # ปล่อยให้ discord ลองเอง
 
 FFMPEG_EXE = _find_ffmpeg()
+
+
+# โหลด libopus (จำเป็นสำหรับส่งเสียงเข้า Discord voice)
+def _load_opus():
+    if discord.opus.is_loaded():
+        return True
+    # ลองชื่อ/พาธที่พบบ่อยบน Linux
+    candidates = [
+        "libopus.so.0", "libopus.so", "opus",
+        "/usr/lib/x86_64-linux-gnu/libopus.so.0",
+        "/usr/lib/libopus.so.0",
+        "/nix/var/nix/profiles/default/lib/libopus.so.0",
+    ]
+    # ลองจาก ctypes.util ด้วย
+    try:
+        import ctypes.util
+        found = ctypes.util.find_library("opus")
+        if found:
+            candidates.insert(0, found)
+    except Exception:
+        pass
+    for name in candidates:
+        try:
+            discord.opus.load_opus(name)
+            if discord.opus.is_loaded():
+                print(f"✅ โหลด libopus จาก: {name}", flush=True)
+                return True
+        except Exception:
+            continue
+    print("❌ โหลด libopus ไม่ได้ — เสียงจะไม่ออก (ต้องติดตั้ง libopus บนเซิร์ฟเวอร์)", flush=True)
+    return False
 import requests
 from discord.ext import tasks
 from telethon import TelegramClient, events
@@ -181,10 +212,13 @@ async def speak_worker():
         text = await speak_queue.get()
         mp3 = None
         try:
+            # ถ้าเปิดใช้งานอยู่แต่หลุดห้อง → ลองต่อกลับก่อน
             vc = await current_vc()
             if not (vc and vc.is_connected()):
+                await reconcile_voice()
+                vc = await current_vc()
+            if not (vc and vc.is_connected()):
                 print("⚠️ ยังไม่ได้อยู่ในห้องเสียง ข้ามข้อความนี้", flush=True)
-                speak_queue.task_done()
                 continue
 
             # 1) สร้างไฟล์เสียง
@@ -194,14 +228,12 @@ async def speak_worker():
                 await edge_tts.Communicate(text, cfg.get("voice_name") or "th-TH-PremwadeeNeural").save(mp3)
             except Exception as e:
                 print(f"❌ สร้างเสียงไม่ได้ (edge-tts): {type(e).__name__}: {e!r}", flush=True)
-                speak_queue.task_done()
                 continue
 
             size = os.path.getsize(mp3) if os.path.exists(mp3) else 0
             print(f"🔎 ไฟล์เสียง {size} bytes | ffmpeg={FFMPEG_EXE}", flush=True)
             if size == 0:
                 print("❌ ไฟล์เสียงว่าง (edge-tts ไม่ส่งเสียงกลับมา)", flush=True)
-                speak_queue.task_done()
                 continue
 
             # 2) เล่นในห้องเสียง
@@ -240,6 +272,7 @@ async def speak_worker():
 async def on_ready():
     print(f"✅ Discord bot ล็อกอิน: {bot.user}", flush=True)
     print(f"🎧 ใช้ ffmpeg จาก: {FFMPEG_EXE}", flush=True)
+    _load_opus()
     if not getattr(bot, "_started", False):
         bot._started = True
         bot.loop.create_task(speak_worker())
