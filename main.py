@@ -1,32 +1,38 @@
 # -*- coding: utf-8 -*-
 """
-Telegram → Discord Voice  (เวอร์ชันควบคุมผ่านเว็บ)
---------------------------------------------------
-บอทอ่าน "ห้องเสียง / เปิด-ปิด / คำกรอง / เสียง" จาก Supabase ตาราง settings
-(key = tts_voice_config) ซึ่งหน้าเว็บ "ศูนย์ควบคุมเสียง" เป็นคนเขียนค่านั้น
-=> ผู้ใช้แค่ติ๊กเลือกในเว็บ ไม่ต้องมายุ่งกับ Railway อีก
+Telegram → Discord Voice  (เวอร์ชัน 3 กะ)
+------------------------------------------
+บอทฟังกลุ่ม Telegram ด้วยบัญชีเราเอง (ไม่ต้องเอาบอทเข้ากลุ่ม)
+แต่ละ "กะ" ตั้งได้เอง (จากหน้าเว็บ):
+    - คำที่จับ (keyword)  → ถ้าเจอคำนี้ในข้อความกลุ่ม
+    - ห้องเสียง           → บอทเข้าห้องนี้
+    - ข้อความที่ให้พูด     → อ่านข้อความนี้ (ไม่ใช่ข้อความในกลุ่ม)
+พูดจบแล้ว "ออกจากห้อง" ทันที
 
-Environment Variables ที่ต้องตั้งใน Railway → Variables:
+ค่าทั้งหมดเก็บใน Supabase settings (key = tts_voice_config)
+
+Environment Variables (Railway → Variables):
     TG_API_ID, TG_API_HASH, TG_SESSION, TARGET_GROUPS
-    DISCORD_TOKEN
-    SUPABASE_URL   = https://xxxx.supabase.co
-    SUPABASE_KEY   = service_role key
-(ไม่ต้องใส่ channel id แล้ว — คุมจากเว็บ)
+    DISCORD_TOKEN, SUPABASE_URL, SUPABASE_KEY
 """
 
 import asyncio
+import ctypes.util
 import json
 import os
-import re
+import shutil
 import sys
 import tempfile
 
-import shutil
-
 import discord
 import edge_tts
+import requests
+from discord.ext import tasks
+from telethon import TelegramClient, events
+from telethon.sessions import StringSession
 
-# หา ffmpeg: ใช้ของระบบก่อน ถ้าไม่มีใช้ตัวที่ฝังมากับ pip (imageio-ffmpeg)
+
+# ---------- หา ffmpeg ----------
 def _find_ffmpeg():
     exe = shutil.which("ffmpeg")
     if exe:
@@ -35,28 +41,21 @@ def _find_ffmpeg():
         import imageio_ffmpeg
         return imageio_ffmpeg.get_ffmpeg_exe()
     except Exception:
-        return "ffmpeg"  # ปล่อยให้ discord ลองเอง
+        return "ffmpeg"
 
 FFMPEG_EXE = _find_ffmpeg()
 
 
-# โหลด libopus (จำเป็นสำหรับส่งเสียงเข้า Discord voice)
+# ---------- โหลด libopus ----------
 def _load_opus():
     if discord.opus.is_loaded():
         return True
-    # ลองชื่อ/พาธที่พบบ่อยบน Linux
-    candidates = [
-        "libopus.so.0", "libopus.so", "opus",
-        "/usr/lib/x86_64-linux-gnu/libopus.so.0",
-        "/usr/lib/libopus.so.0",
-        "/nix/var/nix/profiles/default/lib/libopus.so.0",
-    ]
-    # ลองจาก ctypes.util ด้วย
+    candidates = ["libopus.so.0", "libopus.so", "opus",
+                  "/usr/lib/x86_64-linux-gnu/libopus.so.0", "/usr/lib/libopus.so.0"]
     try:
-        import ctypes.util
-        found = ctypes.util.find_library("opus")
-        if found:
-            candidates.insert(0, found)
+        f = ctypes.util.find_library("opus")
+        if f:
+            candidates.insert(0, f)
     except Exception:
         pass
     for name in candidates:
@@ -67,14 +66,11 @@ def _load_opus():
                 return True
         except Exception:
             continue
-    print("❌ โหลด libopus ไม่ได้ — เสียงจะไม่ออก (ต้องติดตั้ง libopus บนเซิร์ฟเวอร์)", flush=True)
+    print("❌ โหลด libopus ไม่ได้", flush=True)
     return False
-import requests
-from discord.ext import tasks
-from telethon import TelegramClient, events
-from telethon.sessions import StringSession
 
-# ---------------- ENV ----------------
+
+# ---------- ENV ----------
 TG_API_ID   = int(os.environ.get("TG_API_ID", "0"))
 TG_API_HASH = os.environ.get("TG_API_HASH", "")
 TG_SESSION  = os.environ.get("TG_SESSION", "")
@@ -82,7 +78,6 @@ TARGET_GROUPS = [g.strip() for g in os.environ.get("TARGET_GROUPS", "").split(",
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN", "")
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
-MAX_CHARS   = int(os.environ.get("MAX_CHARS", "400"))
 
 _required = {
     "TG_API_ID": TG_API_ID, "TG_API_HASH": TG_API_HASH, "TG_SESSION": TG_SESSION,
@@ -91,47 +86,27 @@ _required = {
 }
 _missing = [k for k, v in _required.items() if not v]
 if _missing:
-    print(f"❌ ยังไม่ได้ตั้งค่า: {', '.join(_missing)} (Railway → Variables)", flush=True)
+    print(f"❌ ยังไม่ได้ตั้งค่า: {', '.join(_missing)}", flush=True)
     sys.exit(1)
 
-# ---------------- state ----------------
+
+# ---------- state ----------
 tg_client = TelegramClient(StringSession(TG_SESSION), TG_API_ID, TG_API_HASH)
 intents = discord.Intents.default()
 intents.voice_states = True
 bot = discord.Client(intents=intents)
 
-speak_queue: "asyncio.Queue[str]" = asyncio.Queue()
+speak_queue: "asyncio.Queue[dict]" = asyncio.Queue()
 _tg_targets: dict[int, str] = {}
 
-# ค่าจากเว็บ (default = ปิด)
+# ค่าจากเว็บ
 cfg = {
-    "enabled": False,
-    "voice_channel_id": "",
-    "keyword_filter": "",
-    "voice_name": "th-TH-PremwadeeNeural",
+    "speech_rate": "-15%",   # ความเร็วเสียง (ติดลบ = ช้าลง)
+    "shifts": [],            # [{name, enabled, keyword, voice_channel_id, voice_channel_name, voice_name, announce_text}]
 }
 
 
-# ---------------- helper ----------------
-def clean_text(text: str) -> str:
-    text = re.sub(r"https?://\S+", " มีลิงก์แนบมา ", text)
-    text = re.sub(r"[^\u0E00-\u0E7Fa-zA-Z0-9\s.,!?%:()\-]", " ", text)
-    text = re.sub(r"\s+", " ", text).strip()
-    return text[:MAX_CHARS]
-
-
-def build_announcement(sender: str, raw: str) -> str:
-    body = clean_text(raw)
-    if not body:
-        return ""
-    tm = re.search(r"(\d{1,2})[:.](\d{2})\s*[-–]\s*(\d{1,2})[:.](\d{2})", raw)
-    if "เช็คชื่อ" in raw and tm:
-        return f"แจ้งเตือน ถึงเวลาเช็คชื่อ รอบเวลา {tm.group(0).replace('.', ':')}. {body}"
-    return f"ข้อความใหม่จาก {sender}. {body}"
-
-
 def fetch_config():
-    """อ่าน tts_voice_config จาก Supabase (settings เก็บ value เป็น JSON string)"""
     try:
         r = requests.get(
             f"{SUPABASE_URL}/rest/v1/settings",
@@ -147,118 +122,87 @@ def fetch_config():
     return None
 
 
-# ---------------- voice ----------------
-async def current_vc() -> discord.VoiceClient | None:
-    return bot.voice_clients[0] if bot.voice_clients else None
-
-
-async def reconcile_voice():
-    """ปรับสถานะห้องเสียงให้ตรงกับ cfg"""
-    vc = await current_vc()
-    want = cfg.get("enabled") and cfg.get("voice_channel_id")
-
-    if not want:
-        if vc and vc.is_connected():
-            await vc.disconnect(force=True)
-            print("⏸️ ปิดเสียง — ออกจากห้อง", flush=True)
-        return
-
-    target_id = int(cfg["voice_channel_id"])
-
-    # ถ้าต่ออยู่แล้วในห้องที่ถูกต้อง → ไม่ต้องทำอะไร (เงียบ)
-    if vc and vc.is_connected() and vc.channel and vc.channel.id == target_id:
-        return
-
-    ch = bot.get_channel(target_id)
-    if ch is None:
-        try:
-            ch = await bot.fetch_channel(target_id)
-        except Exception as e:
-            print(f"หาห้องไม่เจอ {target_id}: {e}", flush=True)
-            return
-    if not isinstance(ch, (discord.VoiceChannel, discord.StageChannel)):
-        print("❌ id ที่เลือกไม่ใช่ห้องเสียง", flush=True)
-        return
-
-    try:
-        if vc and vc.is_connected():
-            await vc.move_to(ch)
-            print(f"➡️ ย้ายไปห้อง: {ch.name}", flush=True)
-        else:
-            await ch.connect(reconnect=True, self_deaf=True)
-            print(f"✅ เข้าห้องเสียง: {ch.name}", flush=True)
-    except discord.ClientException:
-        # ต่ออยู่แล้ว (แข่งกันหลายรอบ) — ข้ามเงียบๆ
-        pass
-
-
 @tasks.loop(seconds=8)
 async def poll_config():
     new = fetch_config()
     if new is not None:
-        changed = new != {k: cfg.get(k) for k in new}
         cfg.update(new)
-        if changed:
-            print(f"🔄 config อัปเดต: enabled={cfg.get('enabled')} room={cfg.get('voice_channel_id')}", flush=True)
-    try:
-        await reconcile_voice()
-    except Exception as e:
-        print(f"reconcile error: {e}", flush=True)
 
 
-# ---------------- speak worker ----------------
+# ---------- speak worker: เข้าห้อง → พูด → ออก ----------
 async def speak_worker():
     while True:
-        text = await speak_queue.get()
+        job = await speak_queue.get()   # {room_id, text, voice_name}
+        vc = None
         mp3 = None
         try:
-            # ถ้าเปิดใช้งานอยู่แต่หลุดห้อง → ลองต่อกลับก่อน
-            vc = await current_vc()
-            if not (vc and vc.is_connected()):
-                await reconcile_voice()
-                vc = await current_vc()
-            if not (vc and vc.is_connected()):
-                print("⚠️ ยังไม่ได้อยู่ในห้องเสียง ข้ามข้อความนี้", flush=True)
+            room_id = int(job["room_id"])
+            text = (job.get("text") or "").strip()
+            voice = job.get("voice_name") or "th-TH-PremwadeeNeural"
+            rate = cfg.get("speech_rate") or "-15%"
+            if not text:
                 continue
 
-            # 1) สร้างไฟล์เสียง
+            ch = bot.get_channel(room_id)
+            if ch is None:
+                try:
+                    ch = await bot.fetch_channel(room_id)
+                except Exception as e:
+                    print(f"หาห้องไม่เจอ {room_id}: {e}", flush=True)
+                    continue
+            if not isinstance(ch, (discord.VoiceChannel, discord.StageChannel)):
+                print("❌ ไม่ใช่ห้องเสียง", flush=True)
+                continue
+
+            # เข้าห้อง (ถ้าค้างอยู่ห้องอื่นให้ย้าย)
+            existing = bot.voice_clients[0] if bot.voice_clients else None
+            if existing and existing.is_connected():
+                vc = existing
+                if vc.channel.id != room_id:
+                    await vc.move_to(ch)
+            else:
+                vc = await ch.connect(reconnect=True, self_deaf=True)
+            print(f"✅ เข้าห้อง: {ch.name}", flush=True)
+
+            # สร้างเสียง (พูดช้าลงตาม rate)
             with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
                 mp3 = f.name
             try:
-                await edge_tts.Communicate(text, cfg.get("voice_name") or "th-TH-PremwadeeNeural").save(mp3)
+                await edge_tts.Communicate(text, voice, rate=rate).save(mp3)
             except Exception as e:
-                print(f"❌ สร้างเสียงไม่ได้ (edge-tts): {type(e).__name__}: {e!r}", flush=True)
+                print(f"❌ สร้างเสียงไม่ได้: {type(e).__name__}: {e!r}", flush=True)
                 continue
 
-            size = os.path.getsize(mp3) if os.path.exists(mp3) else 0
-            print(f"🔎 ไฟล์เสียง {size} bytes | ffmpeg={FFMPEG_EXE}", flush=True)
-            if size == 0:
-                print("❌ ไฟล์เสียงว่าง (edge-tts ไม่ส่งเสียงกลับมา)", flush=True)
+            if not os.path.exists(mp3) or os.path.getsize(mp3) == 0:
+                print("❌ ไฟล์เสียงว่าง", flush=True)
                 continue
 
-            # 2) เล่นในห้องเสียง
+            # เล่น
             while vc.is_playing():
                 await asyncio.sleep(0.3)
-
             done = asyncio.Event()
-            play_err = {}
+            perr = {}
             def _after(err):
                 if err:
-                    play_err["e"] = err
+                    perr["e"] = err
                 bot.loop.call_soon_threadsafe(done.set)
-
-            source = discord.FFmpegPCMAudio(mp3, executable=FFMPEG_EXE)
-            vc.play(source, after=_after)
+            vc.play(discord.FFmpegPCMAudio(mp3, executable=FFMPEG_EXE), after=_after)
             await done.wait()
-
-            if play_err.get("e"):
-                print(f"❌ เล่นเสียงไม่ได้ (playback): {type(play_err['e']).__name__}: {play_err['e']!r}", flush=True)
+            if perr.get("e"):
+                print(f"❌ เล่นเสียงไม่ได้: {perr['e']!r}", flush=True)
             else:
                 print("🔊 พูดสำเร็จ", flush=True)
 
         except Exception as e:
             print(f"speak error: {type(e).__name__}: {e!r}", flush=True)
         finally:
+            # ออกจากห้องเสมอเมื่อพูดจบ
+            try:
+                if vc and vc.is_connected():
+                    await vc.disconnect(force=True)
+                    print("👋 ออกจากห้องแล้ว", flush=True)
+            except Exception:
+                pass
             if mp3 and os.path.exists(mp3):
                 try:
                     os.remove(mp3)
@@ -267,11 +211,11 @@ async def speak_worker():
             speak_queue.task_done()
 
 
-# ---------------- discord events ----------------
+# ---------- discord ----------
 @bot.event
 async def on_ready():
     print(f"✅ Discord bot ล็อกอิน: {bot.user}", flush=True)
-    print(f"🎧 ใช้ ffmpeg จาก: {FFMPEG_EXE}", flush=True)
+    print(f"🎧 ffmpeg: {FFMPEG_EXE}", flush=True)
     _load_opus()
     if not getattr(bot, "_started", False):
         bot._started = True
@@ -279,7 +223,7 @@ async def on_ready():
         poll_config.start()
 
 
-# ---------------- telegram ----------------
+# ---------- telegram ----------
 async def start_telegram():
     await tg_client.start()
     me = await tg_client.get_me()
@@ -300,22 +244,25 @@ async def start_telegram():
 
     @tg_client.on(events.NewMessage(chats=list(_tg_targets.keys())))
     async def handler(event):
-        if not cfg.get("enabled"):
-            return
         raw = (event.raw_text or "").strip()
         if not raw:
             return
-        kw = (cfg.get("keyword_filter") or "").strip()
-        if kw:
-            words = [w.strip() for w in kw.split(",") if w.strip()]
-            if words and not any(w in raw for w in words):
-                return
-        sender = await event.get_sender()
-        name = getattr(sender, "first_name", None) or getattr(sender, "title", None) or "สมาชิก"
-        text = build_announcement(name, raw)
-        if text:
-            print(f"[อ่าน] {text[:70]}", flush=True)
-            await speak_queue.put(text)
+        shifts = cfg.get("shifts") or []
+        for sh in shifts:
+            if not sh.get("enabled"):
+                continue
+            kw = (sh.get("keyword") or "").strip()
+            room = sh.get("voice_channel_id")
+            text = (sh.get("announce_text") or "").strip()
+            if not (kw and room and text):
+                continue
+            if kw in raw:
+                print(f"[ตรงคำ] กะ='{sh.get('name')}' คำ='{kw}'", flush=True)
+                await speak_queue.put({
+                    "room_id": room,
+                    "text": text,
+                    "voice_name": sh.get("voice_name"),
+                })
 
     print(f"✅ พร้อมฟัง {len(_tg_targets)} กลุ่ม", flush=True)
 
