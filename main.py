@@ -133,6 +133,11 @@ async def reconcile_voice():
         return
 
     target_id = int(cfg["voice_channel_id"])
+
+    # ถ้าต่ออยู่แล้วในห้องที่ถูกต้อง → ไม่ต้องทำอะไร (เงียบ)
+    if vc and vc.is_connected() and vc.channel and vc.channel.id == target_id:
+        return
+
     ch = bot.get_channel(target_id)
     if ch is None:
         try:
@@ -144,13 +149,16 @@ async def reconcile_voice():
         print("❌ id ที่เลือกไม่ใช่ห้องเสียง", flush=True)
         return
 
-    if vc and vc.is_connected():
-        if vc.channel.id != target_id:
+    try:
+        if vc and vc.is_connected():
             await vc.move_to(ch)
             print(f"➡️ ย้ายไปห้อง: {ch.name}", flush=True)
-    else:
-        await ch.connect(reconnect=True, self_deaf=True)
-        print(f"✅ เข้าห้องเสียง: {ch.name}", flush=True)
+        else:
+            await ch.connect(reconnect=True, self_deaf=True)
+            print(f"✅ เข้าห้องเสียง: {ch.name}", flush=True)
+    except discord.ClientException:
+        # ต่ออยู่แล้ว (แข่งกันหลายรอบ) — ข้ามเงียบๆ
+        pass
 
 
 @tasks.loop(seconds=8)
@@ -171,24 +179,59 @@ async def poll_config():
 async def speak_worker():
     while True:
         text = await speak_queue.get()
+        mp3 = None
         try:
             vc = await current_vc()
             if not (vc and vc.is_connected()):
+                print("⚠️ ยังไม่ได้อยู่ในห้องเสียง ข้ามข้อความนี้", flush=True)
                 speak_queue.task_done()
                 continue
+
+            # 1) สร้างไฟล์เสียง
             with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
                 mp3 = f.name
-            await edge_tts.Communicate(text, cfg.get("voice_name") or "th-TH-PremwadeeNeural").save(mp3)
+            try:
+                await edge_tts.Communicate(text, cfg.get("voice_name") or "th-TH-PremwadeeNeural").save(mp3)
+            except Exception as e:
+                print(f"❌ สร้างเสียงไม่ได้ (edge-tts): {type(e).__name__}: {e!r}", flush=True)
+                speak_queue.task_done()
+                continue
+
+            size = os.path.getsize(mp3) if os.path.exists(mp3) else 0
+            print(f"🔎 ไฟล์เสียง {size} bytes | ffmpeg={FFMPEG_EXE}", flush=True)
+            if size == 0:
+                print("❌ ไฟล์เสียงว่าง (edge-tts ไม่ส่งเสียงกลับมา)", flush=True)
+                speak_queue.task_done()
+                continue
+
+            # 2) เล่นในห้องเสียง
             while vc.is_playing():
                 await asyncio.sleep(0.3)
+
             done = asyncio.Event()
-            vc.play(discord.FFmpegPCMAudio(mp3, executable=FFMPEG_EXE),
-                    after=lambda e: bot.loop.call_soon_threadsafe(done.set))
+            play_err = {}
+            def _after(err):
+                if err:
+                    play_err["e"] = err
+                bot.loop.call_soon_threadsafe(done.set)
+
+            source = discord.FFmpegPCMAudio(mp3, executable=FFMPEG_EXE)
+            vc.play(source, after=_after)
             await done.wait()
-            os.remove(mp3)
+
+            if play_err.get("e"):
+                print(f"❌ เล่นเสียงไม่ได้ (playback): {type(play_err['e']).__name__}: {play_err['e']!r}", flush=True)
+            else:
+                print("🔊 พูดสำเร็จ", flush=True)
+
         except Exception as e:
-            print(f"speak error: {e}", flush=True)
+            print(f"speak error: {type(e).__name__}: {e!r}", flush=True)
         finally:
+            if mp3 and os.path.exists(mp3):
+                try:
+                    os.remove(mp3)
+                except Exception:
+                    pass
             speak_queue.task_done()
 
 
