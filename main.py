@@ -252,17 +252,23 @@ async def start_telegram():
             if not sh.get("enabled"):
                 continue
             kw = (sh.get("keyword") or "").strip()
-            room = sh.get("voice_channel_id")
             text = (sh.get("announce_text") or "").strip()
-            if not (kw and room and text):
+            # รองรับทั้งแบบหลายห้อง (voice_channel_ids) และแบบเก่าห้องเดียว (voice_channel_id)
+            rooms = sh.get("voice_channel_ids")
+            if not rooms:
+                one = sh.get("voice_channel_id")
+                rooms = [one] if one else []
+            rooms = [r for r in rooms if r]
+            if not (kw and rooms and text):
                 continue
             if kw in raw:
-                print(f"[ตรงคำ] กะ='{sh.get('name')}' คำ='{kw}'", flush=True)
-                await speak_queue.put({
-                    "room_id": room,
-                    "text": text,
-                    "voice_name": sh.get("voice_name"),
-                })
+                print(f"[ตรงคำ] กะ='{sh.get('name')}' คำ='{kw}' จำนวนห้อง={len(rooms)}", flush=True)
+                for room in rooms:
+                    await speak_queue.put({
+                        "room_id": room,
+                        "text": text,
+                        "voice_name": sh.get("voice_name"),
+                    })
 
     print(f"✅ พร้อมฟัง {len(_tg_targets)} กลุ่ม", flush=True)
 
