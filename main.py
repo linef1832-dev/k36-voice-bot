@@ -373,6 +373,25 @@ async def on_ready():
         config_loop.start()
         status_loop.start()
         schedule_loop.start()
+        telegram_list_loop.start()
+
+
+async def _publish_telegram_list():
+    """ดึงรายชื่อกลุ่ม Telegram ที่บัญชีอยู่ (id + ชื่อ) เก็บใน Supabase ให้เว็บเลือก"""
+    try:
+        items = []
+        async for d in tg_client.iter_dialogs():
+            if d.is_group or d.is_channel:
+                items.append({"id": str(d.id), "title": d.name or ""})
+        _sb_upsert_setting("telegram_groups_list", items)
+        print(f"📋 อัปเดตรายชื่อกลุ่ม Telegram: {len(items)} กลุ่ม", flush=True)
+    except Exception as e:
+        print(f"ดึงรายชื่อกลุ่มไม่ได้: {e}", flush=True)
+
+
+@tasks.loop(minutes=5)
+async def telegram_list_loop():
+    await _publish_telegram_list()
 
 
 # ---------- telegram ----------
@@ -396,8 +415,15 @@ async def start_telegram():
         dedupe_sec = int(cfg.get("dedupe_seconds") or 0)
 
         for grp in cfg.get("groups") or []:
+            gid = str(grp.get("telegram_group_id") or "").strip()
             gname = (grp.get("telegram_group") or "").strip()
-            if not gname or gname not in title:
+            matched = False
+            if gid:
+                if str(event.chat_id) == gid:
+                    matched = True
+            elif gname and gname in title:
+                matched = True
+            if not matched:
                 continue
             for sh in grp.get("shifts") or []:
                 if not sh.get("enabled"):
