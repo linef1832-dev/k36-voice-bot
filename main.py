@@ -102,7 +102,8 @@ _tg_targets: dict[int, str] = {}
 # ค่าจากเว็บ
 cfg = {
     "speech_rate": "-15%",   # ความเร็วเสียง (ติดลบ = ช้าลง)
-    "shifts": [],            # [{name, enabled, keyword, voice_channel_id, voice_channel_name, voice_name, announce_text}]
+    "telegram_groups": [],   # กลุ่ม Telegram ที่จะฟัง (ตั้งจากเว็บ) ว่าง = ใช้ค่าจาก ENV
+    "shifts": [],            # [{name, enabled, keyword, voice_channel_ids[], voice_name, announce_text, repeat}]
 }
 
 
@@ -231,36 +232,46 @@ async def on_ready():
 
 
 # ---------- telegram ----------
+def _target_group_names():
+    """กลุ่มที่จะฟัง: ใช้จากเว็บก่อน (cfg.telegram_groups) ถ้าว่างใช้จาก ENV"""
+    web = cfg.get("telegram_groups") or []
+    web = [str(g).strip() for g in web if str(g).strip()]
+    return web if web else TARGET_GROUPS
+
+
 async def start_telegram():
     await tg_client.start()
     me = await tg_client.get_me()
     print(f"✅ Telegram ล็อกอิน: {me.first_name}", flush=True)
+    print(f"👂 กลุ่มเริ่มต้น: {', '.join(_target_group_names()) or '(ยังไม่ตั้ง)'}", flush=True)
 
-    async for d in tg_client.iter_dialogs():
-        for g in TARGET_GROUPS:
-            if g in (d.name or "") or str(d.id) == g:
-                _tg_targets[d.id] = d.name
-                print(f"เจอกลุ่ม: {d.name} (id: {d.id})", flush=True)
-
-    if not _tg_targets:
-        print("❌ ไม่เจอกลุ่ม — รายชื่อทั้งหมด:", flush=True)
-        async for d in tg_client.iter_dialogs():
-            if d.is_group or d.is_channel:
-                print(f"  - {d.name} (id: {d.id})", flush=True)
-        return
-
-    @tg_client.on(events.NewMessage(chats=list(_tg_targets.keys())))
+    # ฟัง "ทุกข้อความ" แล้วค่อยกรองด้วยชื่อกลุ่ม → เปลี่ยนกลุ่มจากเว็บได้ทันที ไม่ต้อง deploy ใหม่
+    @tg_client.on(events.NewMessage())
     async def handler(event):
         raw = (event.raw_text or "").strip()
         if not raw:
             return
+
+        # เอาเฉพาะกลุ่ม/แชนแนล
+        if not (event.is_group or event.is_channel):
+            return
+
+        # กรองด้วยชื่อกลุ่ม
+        try:
+            chat = await event.get_chat()
+            title = getattr(chat, "title", "") or ""
+        except Exception:
+            title = ""
+        wanted = _target_group_names()
+        if wanted and not any(g in title for g in wanted):
+            return
+
         shifts = cfg.get("shifts") or []
         for sh in shifts:
             if not sh.get("enabled"):
                 continue
             kw = (sh.get("keyword") or "").strip()
             text = (sh.get("announce_text") or "").strip()
-            # รองรับทั้งแบบหลายห้อง (voice_channel_ids) และแบบเก่าห้องเดียว (voice_channel_id)
             rooms = sh.get("voice_channel_ids")
             if not rooms:
                 one = sh.get("voice_channel_id")
@@ -272,7 +283,7 @@ async def start_telegram():
                 repeat = int(sh.get("repeat") or 1)
                 if repeat < 1:
                     repeat = 1
-                print(f"[ตรงคำ] กะ='{sh.get('name')}' คำ='{kw}' ห้อง={len(rooms)} รอบ={repeat}", flush=True)
+                print(f"[ตรงคำ] กลุ่ม='{title}' กะ='{sh.get('name')}' คำ='{kw}' ห้อง={len(rooms)} รอบ={repeat}", flush=True)
                 for room in rooms:
                     await speak_queue.put({
                         "room_id": room,
@@ -281,7 +292,7 @@ async def start_telegram():
                         "repeat": repeat,
                     })
 
-    print(f"✅ พร้อมฟัง {len(_tg_targets)} กลุ่ม", flush=True)
+    print("✅ พร้อมฟังข้อความแล้ว (กรองตามชื่อกลุ่มที่ตั้งในเว็บ)", flush=True)
 
 
 async def main():
