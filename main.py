@@ -101,9 +101,8 @@ _tg_targets: dict[int, str] = {}
 
 # ค่าจากเว็บ
 cfg = {
-    "speech_rate": "-15%",   # ความเร็วเสียง (ติดลบ = ช้าลง)
-    "telegram_groups": [],   # กลุ่ม Telegram ที่จะฟัง (ตั้งจากเว็บ) ว่าง = ใช้ค่าจาก ENV
-    "shifts": [],            # [{name, enabled, keyword, voice_channel_ids[], voice_name, announce_text, repeat}]
+    "speech_rate": "-15%",
+    "groups": [],   # [{telegram_group, shifts:[{name,enabled,keyword,voice_name,repeat,rooms:[{id,text}]}]}]
 }
 
 
@@ -232,67 +231,76 @@ async def on_ready():
 
 
 # ---------- telegram ----------
-def _target_group_names():
-    """กลุ่มที่จะฟัง: ใช้จากเว็บก่อน (cfg.telegram_groups) ถ้าว่างใช้จาก ENV"""
-    web = cfg.get("telegram_groups") or []
-    web = [str(g).strip() for g in web if str(g).strip()]
-    return web if web else TARGET_GROUPS
+def _shift_rooms(sh):
+    """คืน [(room_id, text)] รองรับทั้งโครงใหม่ (rooms) และเก่า (voice_channel_ids+announce_text)"""
+    out = []
+    rooms = sh.get("rooms")
+    if isinstance(rooms, list) and rooms:
+        for r in rooms:
+            rid = str(r.get("id") or "").strip()
+            txt = (r.get("text") or "").strip() or (sh.get("announce_text") or "").strip()
+            if rid and txt:
+                out.append((rid, txt))
+    else:
+        # โครงเก่า
+        ids = sh.get("voice_channel_ids") or ([sh.get("voice_channel_id")] if sh.get("voice_channel_id") else [])
+        txt = (sh.get("announce_text") or "").strip()
+        for rid in ids:
+            rid = str(rid or "").strip()
+            if rid and txt:
+                out.append((rid, txt))
+    return out
 
 
 async def start_telegram():
     await tg_client.start()
     me = await tg_client.get_me()
     print(f"✅ Telegram ล็อกอิน: {me.first_name}", flush=True)
-    print(f"👂 กลุ่มเริ่มต้น: {', '.join(_target_group_names()) or '(ยังไม่ตั้ง)'}", flush=True)
 
-    # ฟัง "ทุกข้อความ" แล้วค่อยกรองด้วยชื่อกลุ่ม → เปลี่ยนกลุ่มจากเว็บได้ทันที ไม่ต้อง deploy ใหม่
     @tg_client.on(events.NewMessage())
     async def handler(event):
         raw = (event.raw_text or "").strip()
         if not raw:
             return
-
-        # เอาเฉพาะกลุ่ม/แชนแนล
         if not (event.is_group or event.is_channel):
             return
 
-        # กรองด้วยชื่อกลุ่ม
         try:
             chat = await event.get_chat()
             title = getattr(chat, "title", "") or ""
         except Exception:
             title = ""
-        wanted = _target_group_names()
-        if wanted and not any(g in title for g in wanted):
-            return
 
-        shifts = cfg.get("shifts") or []
-        for sh in shifts:
-            if not sh.get("enabled"):
+        groups = cfg.get("groups") or []
+        for grp in groups:
+            gname = (grp.get("telegram_group") or "").strip()
+            if not gname:
                 continue
-            kw = (sh.get("keyword") or "").strip()
-            text = (sh.get("announce_text") or "").strip()
-            rooms = sh.get("voice_channel_ids")
-            if not rooms:
-                one = sh.get("voice_channel_id")
-                rooms = [one] if one else []
-            rooms = [r for r in rooms if r]
-            if not (kw and rooms and text):
+            if gname not in title:
                 continue
-            if kw in raw:
+            for sh in grp.get("shifts") or []:
+                if not sh.get("enabled"):
+                    continue
+                kw = (sh.get("keyword") or "").strip()
+                if not kw or kw not in raw:
+                    continue
                 repeat = int(sh.get("repeat") or 1)
                 if repeat < 1:
                     repeat = 1
-                print(f"[ตรงคำ] กลุ่ม='{title}' กะ='{sh.get('name')}' คำ='{kw}' ห้อง={len(rooms)} รอบ={repeat}", flush=True)
-                for room in rooms:
+                voice = sh.get("voice_name") or "th-TH-PremwadeeNeural"
+                pairs = _shift_rooms(sh)
+                if not pairs:
+                    continue
+                print(f"[ตรงคำ] กลุ่ม='{title}' กะ='{sh.get('name')}' คำ='{kw}' ห้อง={len(pairs)} รอบ={repeat}", flush=True)
+                for rid, txt in pairs:
                     await speak_queue.put({
-                        "room_id": room,
-                        "text": text,
-                        "voice_name": sh.get("voice_name"),
+                        "room_id": rid,
+                        "text": txt,
+                        "voice_name": voice,
                         "repeat": repeat,
                     })
 
-    print("✅ พร้อมฟังข้อความแล้ว (กรองตามชื่อกลุ่มที่ตั้งในเว็บ)", flush=True)
+    print("✅ พร้อมฟังข้อความแล้ว (กรองตามกลุ่ม/กะ/ห้อง ที่ตั้งในเว็บ)", flush=True)
 
 
 async def main():
