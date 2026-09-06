@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-Telegram → Discord Voice  (เวอร์ชันเต็ม)
-ฟีเจอร์:
+Telegram → Discord Voice  (เวอร์ชันกองบอท Multi-Bot)
+ฟีเจอร์เดิมครบ:
   - หลายกลุ่ม × 3 กะ, แต่ละห้องมีข้อความเฉพาะ
   - จับคำ → เข้าห้อง → (ติ๊งต่อง) → พูดซ้ำหลายรอบ → ออกจากห้อง
   - ปุ่มทดสอบเสียงจากเว็บ (สั่งพูดทันที)
@@ -9,8 +9,15 @@ Telegram → Discord Voice  (เวอร์ชันเต็ม)
   - เขียนสถานะสด + ประวัติการพูด ให้เว็บอ่าน
   - กันจับซ้ำ (ภายใน N วินาที) + ตั้งช่วงเวลาทำงานของแต่ละกะ
 
+🤖 ใหม่: กองบอทหลายตัวพูดขนานกัน
+  - บอทหลัก = DISCORD_TOKEN ใน ENV (เหมือนเดิม ไม่ต้องแตะ)
+  - บอทเสริม = เพิ่มจากหน้าเว็บ (แท็บ "กองบอท") เก็บใน tts_voice_config.bots
+  - แต่ละตัวมีคิวของตัวเอง → 9 ห้อง + 3 บอท = เสร็จใน ~3 รอบพูด แทนที่จะเป็น 9
+  - โหมดแบ่งงาน: auto (กระจายให้ตัวที่ว่างสุด) / manual (ห้องผูกบอทได้, ที่เหลือ auto)
+  - เพิ่ม/ลบ/ปิดบอทจากเว็บ มีผลใน ~5 วินาที ไม่ต้อง restart
+
 Config เก็บใน Supabase settings (key = tts_voice_config)
-บอทเขียน: tts_status (สถานะ), tts_logs (ประวัติ) ; อ่าน: tts_command (ปุ่มทดสอบ)
+บอทเขียน: tts_status (สถานะรายตัว), tts_logs (ประวัติ+ชื่อบอท) ; อ่าน: tts_command (ปุ่มทดสอบ, มี bot_id ได้)
 """
 
 import asyncio
@@ -50,6 +57,8 @@ CHIME_PATH = None  # จะสร้างตอน startup
 def _make_chime():
     """สร้างไฟล์เสียงเตือน (ติ๊งต่อง) ครั้งเดียว"""
     global CHIME_PATH
+    if CHIME_PATH:
+        return
     try:
         path = os.path.join(tempfile.gettempdir(), "tts_chime.mp3")
         cmd = [
@@ -111,18 +120,14 @@ _SB_HEADERS = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"
 
 # ---------- state ----------
 tg_client = TelegramClient(StringSession(TG_SESSION), TG_API_ID, TG_API_HASH)
-intents = discord.Intents.default()
-intents.voice_states = True
-bot = discord.Client(intents=intents)
 
-speak_queue: "asyncio.Queue[dict]" = asyncio.Queue()
-cfg = {"speech_rate": "-15%", "chime_enabled": True, "dedupe_seconds": 60, "groups": [], "schedules": []}
+cfg = {"speech_rate": "-15%", "chime_enabled": True, "dedupe_seconds": 60,
+       "groups": [], "schedules": [], "bots": [], "dispatch_mode": "auto"}
 
-_current_room = ""
-_last_spoke_at = ""
 _last_cmd_id = ""
 _dedupe = {}            # (group,shift,kw) -> ts
 _sched_fired = {}       # index -> "YYYY-MM-DD HH:MM"
+_logs_has_bot_col = True   # ถ้าตาราง tts_logs ยังไม่มีคอลัมน์ bot_name จะ fallback อัตโนมัติ
 
 
 def _bkk_now():
@@ -164,72 +169,269 @@ def _sb_upsert_setting(key, value):
 
 
 def _sb_insert_log(row):
+    """เขียน log — ถ้าตารางยังไม่มีคอลัมน์ bot_name (ยังไม่ได้รัน ALTER TABLE) ให้ตัดออกแล้วส่งใหม่"""
+    global _logs_has_bot_col
     try:
-        requests.post(f"{SUPABASE_URL}/rest/v1/tts_logs",
-                      headers={**_SB_HEADERS, "Prefer": "return=minimal"},
-                      json=row, timeout=10)
+        if not _logs_has_bot_col:
+            row = {k: v for k, v in row.items() if k != "bot_name"}
+        r = requests.post(f"{SUPABASE_URL}/rest/v1/tts_logs",
+                          headers={**_SB_HEADERS, "Prefer": "return=minimal"},
+                          json=row, timeout=10)
+        if r.status_code >= 400 and "bot_name" in row:
+            _logs_has_bot_col = False
+            print("⚠️ tts_logs ยังไม่มีคอลัมน์ bot_name (รัน: ALTER TABLE tts_logs ADD COLUMN bot_name text;) — ส่ง log แบบไม่มีชื่อบอทไปก่อน", flush=True)
+            row.pop("bot_name", None)
+            requests.post(f"{SUPABASE_URL}/rest/v1/tts_logs",
+                          headers={**_SB_HEADERS, "Prefer": "return=minimal"},
+                          json=row, timeout=10)
     except Exception as e:
         print(f"เขียน log ไม่ได้: {e}", flush=True)
 
 
 # ---------- rooms helper ----------
 def _shift_rooms(sh):
+    """คืน [(room_id, text, bot_id)] — bot_id = บอทที่ห้องนี้ผูกไว้ (โหมด manual), '' = ให้แบ่งอัตโนมัติ"""
     out = []
     rooms = sh.get("rooms")
     if isinstance(rooms, list) and rooms:
         for r in rooms:
             rid = str(r.get("id") or "").strip()
             txt = (r.get("text") or "").strip() or (sh.get("announce_text") or "").strip()
+            bid = str(r.get("bot_id") or "").strip()
             if rid and txt:
-                out.append((rid, txt))
+                out.append((rid, txt, bid))
     else:
         ids = sh.get("voice_channel_ids") or ([sh.get("voice_channel_id")] if sh.get("voice_channel_id") else [])
         txt = (sh.get("announce_text") or "").strip()
         for rid in ids:
             rid = str(rid or "").strip()
             if rid and txt:
-                out.append((rid, txt))
+                out.append((rid, txt, ""))
     return out
 
 
-# ---------- loops ----------
+# ══════════════════════════════════════════════════════════════════
+# 🤖 กองบอท (Fleet) — บอทหลายตัว แต่ละตัวมีคิว+worker ของตัวเอง
+# ══════════════════════════════════════════════════════════════════
+class BotUnit:
+    def __init__(self, bot_id, name, token, is_main=False):
+        self.id = str(bot_id)
+        self.name = name or self.id
+        self.token = token
+        self.is_main = is_main
+        intents = discord.Intents.default()
+        intents.voice_states = True
+        self.client = discord.Client(intents=intents)
+        self.queue: "asyncio.Queue[dict]" = asyncio.Queue()
+        self.current_room = ""
+        self.last_spoke_at = ""
+        self._client_task = None
+        self._worker_task = None
+        self._stopping = False
+
+        unit = self
+
+        @self.client.event
+        async def on_ready():
+            print(f"✅ [{unit.display_name()}] Discord ล็อกอิน: {unit.client.user}", flush=True)
+            _load_opus()
+            _make_chime()
+
+    def display_name(self):
+        if self.is_main and self.client.user:
+            return self.name or str(self.client.user)
+        return self.name
+
+    def is_ready(self):
+        try:
+            return self.client.is_ready() and not self.client.is_closed()
+        except Exception:
+            return False
+
+    def live_room(self):
+        """ห้องที่กำลังอยู่จริงตอนนี้ (จาก voice client) หรือห้องที่ worker จำไว้"""
+        try:
+            if self.client.voice_clients and self.client.voice_clients[0].is_connected():
+                ch = self.client.voice_clients[0].channel
+                if ch:
+                    return ch.name
+        except Exception:
+            pass
+        return self.current_room
+
+    def busy_score(self):
+        """คะแนนความยุ่ง — ใช้เลือกบอทที่ว่างสุดตอนแบ่งงาน"""
+        s = self.queue.qsize()
+        try:
+            if self.client.voice_clients:
+                s += 1  # กำลังอยู่ในห้อง = ยุ่งอยู่
+        except Exception:
+            pass
+        return s
+
+    def start(self):
+        self._client_task = asyncio.create_task(self._run_client(), name=f"client:{self.id}")
+        self._worker_task = asyncio.create_task(speak_worker(self), name=f"worker:{self.id}")
+
+    async def _run_client(self):
+        try:
+            await self.client.start(self.token)
+        except discord.LoginFailure:
+            print(f"❌ [{self.name}] Token ไม่ถูกต้อง — เช็ค Token ในหน้าเว็บ (แท็บกองบอท)", flush=True)
+        except Exception as e:
+            if not self._stopping:
+                print(f"❌ [{self.name}] client หลุด: {type(e).__name__}: {e!r}", flush=True)
+
+    async def stop(self):
+        self._stopping = True
+        for t in (self._worker_task,):
+            if t:
+                t.cancel()
+        try:
+            await self.client.close()
+        except Exception:
+            pass
+        if self._client_task:
+            try:
+                await asyncio.wait_for(self._client_task, timeout=10)
+            except Exception:
+                pass
+        print(f"🛑 [{self.name}] ปิดแล้ว", flush=True)
+
+
+FLEET: "dict[str, BotUnit]" = {}   # bot_id -> BotUnit ("main" = บอทจาก ENV)
+
+
+def _fleet_sig(bots_cfg):
+    """ลายเซ็น config บอทเสริม — เปลี่ยนเมื่อ เพิ่ม/ลบ/แก้ token/เปิดปิด"""
+    return json.dumps([[str(b.get("id")), (b.get("token") or "").strip(), bool(b.get("enabled", True))]
+                       for b in (bots_cfg or [])], sort_keys=True)
+
+_last_fleet_sig = None
+
+
+async def sync_fleet():
+    """เทียบ config กับกองบอทปัจจุบัน → เปิดตัวใหม่ / ปิดตัวที่ถูกลบ / อัปเดตชื่อ"""
+    global _last_fleet_sig
+    bots_cfg = cfg.get("bots") or []
+    sig = _fleet_sig(bots_cfg)
+    if sig == _last_fleet_sig:
+        # config ไม่เปลี่ยน — อัปเดตแค่ชื่อ (ชื่อเปลี่ยนไม่ต้อง restart client)
+        for b in bots_cfg:
+            u = FLEET.get(str(b.get("id")))
+            if u and b.get("name"):
+                u.name = b["name"]
+        return
+    _last_fleet_sig = sig
+
+    want = {}
+    for b in bots_cfg:
+        bid = str(b.get("id") or "").strip()
+        tok = (b.get("token") or "").strip()
+        if bid and tok and b.get("enabled", True):
+            want[bid] = b
+
+    # ปิดบอทที่ถูกลบ/ปิดใช้/เปลี่ยน token
+    for bid in list(FLEET.keys()):
+        if bid == "main":
+            continue
+        u = FLEET[bid]
+        wb = want.get(bid)
+        if not wb or (wb.get("token") or "").strip() != u.token:
+            del FLEET[bid]
+            asyncio.create_task(u.stop())
+
+    # เปิดบอทตัวใหม่
+    for bid, b in want.items():
+        if bid in FLEET:
+            FLEET[bid].name = b.get("name") or FLEET[bid].name
+            continue
+        u = BotUnit(bid, b.get("name") or f"บอท {bid[-4:]}", (b.get("token") or "").strip())
+        FLEET[bid] = u
+        u.start()
+        print(f"🚀 สตาร์ทบอทเสริม: {u.name}", flush=True)
+
+
+def _online_units():
+    return [u for u in FLEET.values() if u.is_ready()]
+
+
+async def dispatch_jobs(jobs):
+    """แบ่งงานให้กองบอท — หัวใจของความเร็ว
+    manual + ห้องผูกบอท → เข้าคิวบอทตัวนั้น (ถ้าออนไลน์)
+    ที่เหลือ → บอทออนไลน์ที่ว่างสุด (นับงานที่เพิ่งแจกรอบนี้ด้วย ให้กระจายจริง)"""
+    units = _online_units()
+    if not units:
+        units = [FLEET["main"]]  # ยังไม่มีตัวไหน ready → เข้าคิวบอทหลักไว้ก่อน เดี๋ยว ready แล้วพูดเอง
+    manual = (cfg.get("dispatch_mode") == "manual")
+    pending = {u.id: 0 for u in units}   # งานที่แจกไปแล้วในรอบนี้
+
+    for job in jobs:
+        target = None
+        bid = str(job.get("bot_id") or "")
+        if manual and bid:
+            u = FLEET.get(bid)
+            if u and u.is_ready():
+                target = u
+                if bid not in pending:
+                    pending[bid] = 0
+        if target is None:
+            target = min(units, key=lambda u: u.busy_score() + pending.get(u.id, 0))
+        pending[target.id] = pending.get(target.id, 0) + 1
+        await target.queue.put(job)
+
+    if len(jobs) > 1:
+        used = [FLEET[i].display_name() for i, n in pending.items() if n > 0]
+        print(f"📦 แจก {len(jobs)} ห้อง → {len(used)} บอท: {', '.join(used)}", flush=True)
+
+
+# ---------- loops (ผูกกับบอทหลัก) ----------
 @tasks.loop(seconds=5)
 async def config_loop():
     global _last_cmd_id
     new = _sb_get_setting("tts_voice_config")
     if isinstance(new, dict):
         cfg.update(new)
+    await sync_fleet()
 
-    # ปุ่มทดสอบจากเว็บ
+    # ปุ่มทดสอบจากเว็บ (มี bot_id = ให้บอทตัวนั้นพูดโดยเฉพาะ)
     cmd = _sb_get_setting("tts_command")
     if isinstance(cmd, dict) and cmd.get("id") and cmd.get("id") != _last_cmd_id:
         _last_cmd_id = cmd.get("id")
         rid = str(cmd.get("room_id") or "").strip()
         txt = (cmd.get("text") or "").strip()
         if rid and txt:
-            print(f"[ทดสอบ] ห้อง={rid}", flush=True)
-            await speak_queue.put({
+            print(f"[ทดสอบ] ห้อง={rid} บอท={cmd.get('bot_id') or 'auto'}", flush=True)
+            await dispatch_jobs([{
                 "room_id": rid, "text": txt,
                 "voice_name": cmd.get("voice_name") or "th-TH-PremwadeeNeural",
                 "repeat": int(cmd.get("repeat") or 1),
+                "bot_id": str(cmd.get("bot_id") or ""),
                 "log": {"kind": "ทดสอบ", "group": "-", "shift": "-", "keyword": "-"},
-            })
+            }])
 
 
 @tasks.loop(seconds=10)
 async def status_loop():
-    online_room = ""
-    try:
-        if bot.voice_clients and bot.voice_clients[0].is_connected():
-            ch = bot.voice_clients[0].channel
-            online_room = ch.name if ch else ""
-    except Exception:
-        pass
+    now = _bkk_now().strftime("%Y-%m-%d %H:%M:%S")
+    bots_arr = []
+    for u in FLEET.values():
+        bots_arr.append({
+            "bot_id": u.id,
+            "name": u.display_name(),
+            "online": u.is_ready(),
+            "current_room": u.live_room() if u.is_ready() else "",
+            "last_spoke_at": u.last_spoke_at,
+            "updated_at": now,
+        })
+    main_u = FLEET.get("main")
     _sb_upsert_setting("tts_status", {
-        "online": True,
-        "current_room": online_room or _current_room,
-        "last_spoke_at": _last_spoke_at,
-        "updated_at": _bkk_now().strftime("%Y-%m-%d %H:%M:%S"),
+        "bots": bots_arr,
+        "updated_at": now,
+        # ── ฟิลด์รูปเก่า เผื่อหน้าเว็บเวอร์ชันก่อนยังเปิดค้างอยู่ ──
+        "online": bool(main_u and main_u.is_ready()),
+        "current_room": (main_u.live_room() if main_u else ""),
+        "last_spoke_at": (main_u.last_spoke_at if main_u else ""),
     })
 
 
@@ -247,36 +449,43 @@ async def schedule_loop():
         _sched_fired[i] = stamp
         voice = sc.get("voice_name") or "th-TH-PremwadeeNeural"
         repeat = int(sc.get("repeat") or 1)
-        for rid, txt in _shift_rooms(sc):
+        jobs = []
+        for rid, txt, bid in _shift_rooms(sc):
             print(f"[ตั้งเวลา] {now_hm} '{sc.get('name')}' ห้อง={rid}", flush=True)
-            await speak_queue.put({
-                "room_id": rid, "text": txt, "voice_name": voice, "repeat": repeat,
+            jobs.append({
+                "room_id": rid, "text": txt, "voice_name": voice, "repeat": repeat, "bot_id": bid,
                 "log": {"kind": "ตั้งเวลา", "group": sc.get("name") or "-", "shift": now_hm, "keyword": "-"},
             })
+        if jobs:
+            await dispatch_jobs(jobs)
 
 
 # ---------- play helpers ----------
 async def _play_file(vc, path):
     while vc.is_playing():
         await asyncio.sleep(0.2)
+    loop = asyncio.get_running_loop()
     done = asyncio.Event()
     err = {}
     def _after(e):
         if e:
             err["e"] = e
-        bot.loop.call_soon_threadsafe(done.set)
+        loop.call_soon_threadsafe(done.set)
     vc.play(discord.FFmpegPCMAudio(path, executable=FFMPEG_EXE), after=_after)
     await done.wait()
     return not err.get("e")
 
 
-async def speak_worker():
-    global _current_room, _last_spoke_at
+async def speak_worker(unit: BotUnit):
+    """worker ประจำบอท 1 ตัว — ไล่คิวของตัวเอง (หลายบอท = หลาย worker วิ่งพร้อมกัน)"""
+    await unit.client.wait_until_ready()
     while True:
-        job = await speak_queue.get()
+        job = await unit.queue.get()
         vc = None
         mp3 = None
         try:
+            if not unit.is_ready():
+                await unit.client.wait_until_ready()
             room_id = int(job["room_id"])
             text = (job.get("text") or "").strip()
             voice = job.get("voice_name") or "th-TH-PremwadeeNeural"
@@ -285,25 +494,29 @@ async def speak_worker():
             if not text:
                 continue
 
-            ch = bot.get_channel(room_id)
+            ch = unit.client.get_channel(room_id)
             if ch is None:
                 try:
-                    ch = await bot.fetch_channel(room_id)
+                    ch = await unit.client.fetch_channel(room_id)
                 except Exception as e:
-                    print(f"หาห้องไม่เจอ {room_id}: {e}", flush=True)
+                    print(f"[{unit.display_name()}] หาห้องไม่เจอ {room_id}: {e} (บอทตัวนี้ถูกเชิญเข้าเซิร์ฟเวอร์หรือยัง?)", flush=True)
                     continue
             if not isinstance(ch, (discord.VoiceChannel, discord.StageChannel)):
                 continue
 
-            existing = bot.voice_clients[0] if bot.voice_clients else None
+            existing = unit.client.voice_clients[0] if unit.client.voice_clients else None
             if existing and existing.is_connected():
                 vc = existing
                 if vc.channel.id != room_id:
-                    await vc.move_to(ch)
+                    if vc.channel.guild.id == ch.guild.id:
+                        await vc.move_to(ch)          # เซิร์ฟเวอร์เดียวกัน → ย้ายห้องเลย (เร็ว)
+                    else:
+                        await vc.disconnect(force=True)  # คนละเซิร์ฟเวอร์ → ต้องออกก่อนค่อยเข้าใหม่
+                        vc = await ch.connect(reconnect=True, self_deaf=True)
             else:
                 vc = await ch.connect(reconnect=True, self_deaf=True)
-            _current_room = ch.name
-            print(f"✅ เข้าห้อง: {ch.name}", flush=True)
+            unit.current_room = ch.name
+            print(f"✅ [{unit.display_name()}] เข้าห้อง: {ch.name}", flush=True)
 
             # เสียงเตือน
             if cfg.get("chime_enabled") and CHIME_PATH:
@@ -318,18 +531,18 @@ async def speak_worker():
             try:
                 await edge_tts.Communicate(text, voice, rate=rate).save(mp3)
             except Exception as e:
-                print(f"❌ สร้างเสียงไม่ได้: {e!r}", flush=True)
+                print(f"❌ [{unit.display_name()}] สร้างเสียงไม่ได้: {e!r}", flush=True)
                 continue
             if not os.path.exists(mp3) or os.path.getsize(mp3) == 0:
                 continue
 
             for n in range(repeat):
                 ok = await _play_file(vc, mp3)
-                print(f"🔊 พูด ({n+1}/{repeat})" + ("" if ok else " (error)"), flush=True)
+                print(f"🔊 [{unit.display_name()}] พูด ({n+1}/{repeat})" + ("" if ok else " (error)"), flush=True)
                 if n < repeat - 1:
                     await asyncio.sleep(0.8)
 
-            _last_spoke_at = _bkk_now().strftime("%Y-%m-%d %H:%M:%S")
+            unit.last_spoke_at = _bkk_now().strftime("%Y-%m-%d %H:%M:%S")
 
             # log
             meta = job.get("log")
@@ -339,43 +552,32 @@ async def speak_worker():
                     "group_name": meta.get("group", "-"),
                     "shift_name": meta.get("shift", "-"),
                     "keyword": meta.get("keyword", "-"),
-                    "room_name": _current_room,
+                    "room_name": unit.current_room,
                     "message": text[:300],
+                    "bot_name": unit.display_name(),
                 })
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
-            print(f"speak error: {type(e).__name__}: {e!r}", flush=True)
+            print(f"[{unit.display_name()}] speak error: {type(e).__name__}: {e!r}", flush=True)
         finally:
             try:
-                if vc and vc.is_connected():
+                # 🌟 ถ้าในคิวตัวเองยังมีงานต่อ ไม่ต้องออกจากห้อง — เดี๋ยว move_to ห้องถัดไปเลย (เร็วกว่า)
+                if vc and vc.is_connected() and unit.queue.empty():
                     await vc.disconnect(force=True)
-                    print("👋 ออกจากห้องแล้ว", flush=True)
+                    print(f"👋 [{unit.display_name()}] ออกจากห้องแล้ว", flush=True)
+                    unit.current_room = ""
             except Exception:
-                pass
-            _current_room = ""
+                unit.current_room = ""
             if mp3 and os.path.exists(mp3):
                 try:
                     os.remove(mp3)
                 except Exception:
                     pass
-            speak_queue.task_done()
+            unit.queue.task_done()
 
 
-# ---------- discord ----------
-@bot.event
-async def on_ready():
-    print(f"✅ Discord bot ล็อกอิน: {bot.user}", flush=True)
-    print(f"🎧 ffmpeg: {FFMPEG_EXE}", flush=True)
-    _load_opus()
-    _make_chime()
-    if not getattr(bot, "_started", False):
-        bot._started = True
-        bot.loop.create_task(speak_worker())
-        config_loop.start()
-        status_loop.start()
-        schedule_loop.start()
-        telegram_list_loop.start()
-
-
+# ---------- telegram ----------
 async def _publish_telegram_list():
     """ดึงรายชื่อกลุ่ม Telegram ที่บัญชีอยู่ (id + ชื่อ) เก็บใน Supabase ให้เว็บเลือก"""
     try:
@@ -394,7 +596,6 @@ async def telegram_list_loop():
     await _publish_telegram_list()
 
 
-# ---------- telegram ----------
 async def start_telegram():
     await tg_client.start()
     me = await tg_client.get_me()
@@ -444,25 +645,43 @@ async def start_telegram():
 
                 repeat = max(1, int(sh.get("repeat") or 1))
                 voice = sh.get("voice_name") or "th-TH-PremwadeeNeural"
-                pairs = _shift_rooms(sh)
-                if not pairs:
+                triples = _shift_rooms(sh)
+                if not triples:
                     continue
-                print(f"[ตรงคำ] กลุ่ม='{title}' กะ='{sh.get('name')}' คำ='{kw}' ห้อง={len(pairs)} รอบ={repeat}", flush=True)
-                for rid, txt in pairs:
-                    await speak_queue.put({
-                        "room_id": rid, "text": txt, "voice_name": voice, "repeat": repeat,
-                        "log": {"kind": "จับคำ", "group": title, "shift": sh.get("name"), "keyword": kw},
-                    })
+                n_bots = len(_online_units()) or 1
+                print(f"[ตรงคำ] กลุ่ม='{title}' กะ='{sh.get('name')}' คำ='{kw}' ห้อง={len(triples)} รอบ={repeat} บอทออนไลน์={n_bots}", flush=True)
+                jobs = [{
+                    "room_id": rid, "text": txt, "voice_name": voice, "repeat": repeat, "bot_id": bid,
+                    "log": {"kind": "จับคำ", "group": title, "shift": sh.get("name"), "keyword": kw},
+                } for rid, txt, bid in triples]
+                await dispatch_jobs(jobs)
 
     print("✅ พร้อมฟังข้อความแล้ว", flush=True)
 
 
+# ---------- main ----------
 async def main():
+    # โหลด config ก่อนสตาร์ท (เผื่อมีบอทเสริมตั้งไว้แล้ว จะได้ขึ้นพร้อมกัน)
+    first = _sb_get_setting("tts_voice_config")
+    if isinstance(first, dict):
+        cfg.update(first)
+
+    # 🤖 บอทหลักจาก ENV (id = "main") — พฤติกรรมเดิม 100%
+    main_unit = BotUnit("main", "บอทหลัก", DISCORD_TOKEN, is_main=True)
+    FLEET["main"] = main_unit
+    main_unit.start()
+
+    # บอทเสริมจากหน้าเว็บ
+    await sync_fleet()
+
+    # loops กลาง (ผูกกับ loop หลัก ไม่ผูกกับ client ตัวใดตัวหนึ่ง)
+    config_loop.start()
+    status_loop.start()
+    schedule_loop.start()
+    telegram_list_loop.start()
+
     await start_telegram()
-    await asyncio.gather(
-        bot.start(DISCORD_TOKEN),
-        tg_client.run_until_disconnected(),
-    )
+    await tg_client.run_until_disconnected()
 
 
 if __name__ == "__main__":
