@@ -29,7 +29,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import discord
 import edge_tts
@@ -66,7 +66,7 @@ def _check_dave():
               f"แก้ requirements.txt เป็น discord.py[voice]>=2.7.1 แล้ว redeploy", flush=True)
 
 
-async def _wait_dave_ready(vc, timeout=15.0):
+async def _wait_dave_ready(vc, timeout=3.0):
     """รอให้ voice client ต่อเสร็จ + DAVE session พร้อมเข้ารหัส ก่อนเล่นเสียง (กันพูดแล้วเงียบ)"""
     t0 = time.monotonic()
     while time.monotonic() - t0 < timeout:
@@ -81,7 +81,11 @@ async def _wait_dave_ready(vc, timeout=15.0):
             if ver == 0 and conn.dave_session is None and time.monotonic() - t0 > 2.0:
                 return True               # ห้องนี้ไม่ใช้ E2EE (เช่น Stage) — ไปต่อได้
         await asyncio.sleep(0.1)
-    print("⚠️ รอ DAVE พร้อมเกินเวลา — จะลองเล่นเสียงต่อ แต่อาจเงียบ", flush=True)
+    conn = getattr(vc, "_connection", None)
+    sess = getattr(conn, "dave_session", None)
+    print(f"⚠️ รอ DAVE พร้อมเกินเวลา (ver={getattr(conn, 'dave_protocol_version', '?')} "
+          f"session={'มี' if sess else 'ไม่มี'} ready={getattr(sess, 'ready', '?')} "
+          f"connected={vc.is_connected()} คนในห้อง={len(getattr(vc.channel, 'members', []))}) — เล่นเสียงต่อ (ปกติถ้าบอทอยู่ในห้องคนเดียว)", flush=True)
     return False
 
 
@@ -162,7 +166,7 @@ _logs_has_bot_col = True   # ถ้าตาราง tts_logs ยังไม�
 
 
 def _bkk_now():
-    return datetime.utcnow() + timedelta(hours=7)  # ไทย = UTC+7
+    return datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(hours=7)  # ไทย = UTC+7
 
 
 def _hm():
