@@ -54,6 +54,37 @@ FFMPEG_EXE = _find_ffmpeg()
 CHIME_PATH = None  # จะสร้างตอน startup
 
 
+# ---------- DAVE (Discord E2EE voice) ----------
+# ตั้งแต่ มี.ค. 2026 Discord บังคับเข้ารหัสเสียง (DAVE) ทุกห้อง — เสียงที่ส่งไปแบบไม่เข้ารหัสจะเงียบ
+# ต้องใช้ discord.py >= 2.7 + แพ็กเกจ davey และต้อง "รอให้ DAVE พร้อม" ก่อนเริ่มเล่นเสียง
+def _check_dave():
+    try:
+        import davey  # noqa: F401
+        print(f"✅ discord.py {discord.__version__} + davey (DAVE E2EE) พร้อม", flush=True)
+    except Exception:
+        print(f"❌ discord.py {discord.__version__} ไม่มี davey — บอทจะเข้าห้องได้แต่เสียงจะเงียบ! "
+              f"แก้ requirements.txt เป็น discord.py[voice]>=2.7.1 แล้ว redeploy", flush=True)
+
+
+async def _wait_dave_ready(vc, timeout=8.0):
+    """รอให้ voice client ต่อเสร็จ + DAVE session พร้อมเข้ารหัส ก่อนเล่นเสียง (กันพูดแล้วเงียบ)"""
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < timeout:
+        conn = getattr(vc, "_connection", None)
+        can = getattr(conn, "can_encrypt", None)
+        ver = getattr(conn, "dave_protocol_version", None)
+        if vc.is_connected():
+            if can is None:               # discord.py เก่า ไม่มี DAVE
+                return True
+            if can:                       # DAVE พร้อมแล้ว
+                return True
+            if ver == 0 and conn.dave_session is None and time.monotonic() - t0 > 2.0:
+                return True               # ห้องนี้ไม่ใช้ E2EE (เช่น Stage) — ไปต่อได้
+        await asyncio.sleep(0.1)
+    print("⚠️ รอ DAVE พร้อมเกินเวลา — จะลองเล่นเสียงต่อ แต่อาจเงียบ", flush=True)
+    return False
+
+
 def _make_chime():
     """สร้างไฟล์เสียงเตือน (ติ๊งต่อง) ครั้งเดียว"""
     global CHIME_PATH
@@ -236,6 +267,7 @@ class BotUnit:
             print(f"✅ [{unit.display_name()}] Discord ล็อกอิน: {unit.client.user}", flush=True)
             _load_opus()
             _make_chime()
+            _check_dave()
 
     def display_name(self):
         if self.is_main and self.client.user:
@@ -517,6 +549,16 @@ async def speak_worker(unit: BotUnit):
                 vc = await ch.connect(reconnect=True, self_deaf=True)
             unit.current_room = ch.name
             print(f"✅ [{unit.display_name()}] เข้าห้อง: {ch.name}", flush=True)
+
+            # 🔐 รอให้ DAVE (E2EE) พร้อมก่อนพูด — ถ้าไม่รอ เสียงชุดแรกจะถูกส่งแบบไม่เข้ารหัสแล้วเงียบ
+            if not await _wait_dave_ready(vc):
+                # ลองต่อใหม่อีกครั้ง (บางทีต่อครั้งแรกค้าง)
+                try:
+                    await vc.disconnect(force=True)
+                except Exception:
+                    pass
+                vc = await ch.connect(reconnect=True, self_deaf=True, timeout=20)
+                await _wait_dave_ready(vc)
 
             # เสียงเตือน
             if cfg.get("chime_enabled") and CHIME_PATH:
