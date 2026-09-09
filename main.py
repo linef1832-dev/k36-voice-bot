@@ -91,13 +91,13 @@ def _make_chime():
     if CHIME_PATH:
         return
     try:
-        path = os.path.join(tempfile.gettempdir(), "tts_chime.mp3")
+        path = os.path.join(tempfile.gettempdir(), "tts_chime.ogg")
         cmd = [
-            FFMPEG_EXE, "-y",
+            FFMPEG_EXE, "-y", "-loglevel", "error",
             "-f", "lavfi", "-i", "sine=frequency=880:duration=0.15",
             "-f", "lavfi", "-i", "sine=frequency=1174:duration=0.22",
             "-filter_complex", "[0][1]concat=n=2:v=0:a=1,volume=0.6",
-            "-ar", "48000", path,
+            "-ar", "48000", "-ac", "2", "-c:a", "libopus", "-b:a", "64k", "-application", "voip", path,
         ]
         subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
         if os.path.exists(path) and os.path.getsize(path) > 0:
@@ -511,6 +511,25 @@ async def _connect_retry(unit, ch, tries=3):
 
 
 # ---------- play helpers ----------
+async def _mp3_to_opus(mp3):
+    """แปลง mp3 จาก edge-tts → Opus 48kHz ครั้งเดียวก่อนเล่น
+    (เดิมเล่นตรงจาก mp3 = ffmpeg ถอดรหัส + Python เข้ารหัส Opus แบบเรียลไทม์ทุก 20ms → CPU หนัก → เสียงสะดุด
+     แบบใหม่ตอนเล่นแค่ copy แพ็กเก็ตที่เข้ารหัสไว้แล้ว เบากว่ามาก)"""
+    ogg = mp3[:-4] + ".ogg"
+    cmd = [FFMPEG_EXE, "-y", "-loglevel", "error", "-i", mp3,
+           "-ar", "48000", "-ac", "2", "-c:a", "libopus", "-b:a", "64k",
+           "-application", "voip", "-frame_duration", "20", ogg]
+    proc = await asyncio.create_subprocess_exec(*cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=30)
+    except asyncio.TimeoutError:
+        proc.kill()
+        return None
+    if os.path.exists(ogg) and os.path.getsize(ogg) > 0:
+        return ogg
+    return None
+
+
 async def _play_file(vc, path):
     while vc.is_playing():
         await asyncio.sleep(0.2)
@@ -521,7 +540,11 @@ async def _play_file(vc, path):
         if e:
             err["e"] = e
         loop.call_soon_threadsafe(done.set)
-    vc.play(discord.FFmpegPCMAudio(path, executable=FFMPEG_EXE), after=_after)
+    if path.endswith(".ogg"):
+        src = discord.FFmpegOpusAudio(path, codec="copy", executable=FFMPEG_EXE)
+    else:
+        src = discord.FFmpegPCMAudio(path, executable=FFMPEG_EXE)
+    vc.play(src, after=_after)
     await done.wait()
     return not err.get("e")
 
@@ -543,6 +566,18 @@ async def speak_worker(unit: BotUnit):
             repeat = max(1, int(job.get("repeat") or 1))
             if not text:
                 continue
+
+            # สร้างเสียงพูด "ก่อน" เข้าห้อง → เข้าห้องปุ๊บพูดได้เลย และไม่กิน CPU ระหว่างอยู่ในห้อง
+            with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
+                mp3 = f.name
+            try:
+                await edge_tts.Communicate(text, voice, rate=rate).save(mp3)
+            except Exception as e:
+                print(f"❌ [{unit.display_name()}] สร้างเสียงไม่ได้: {e!r}", flush=True)
+                continue
+            if not os.path.exists(mp3) or os.path.getsize(mp3) == 0:
+                continue
+            play_path = await _mp3_to_opus(mp3) or mp3
 
             ch = unit.client.get_channel(room_id)
             if ch is None:
@@ -579,19 +614,8 @@ async def speak_worker(unit: BotUnit):
                 except Exception:
                     pass
 
-            # สร้างเสียงพูด
-            with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
-                mp3 = f.name
-            try:
-                await edge_tts.Communicate(text, voice, rate=rate).save(mp3)
-            except Exception as e:
-                print(f"❌ [{unit.display_name()}] สร้างเสียงไม่ได้: {e!r}", flush=True)
-                continue
-            if not os.path.exists(mp3) or os.path.getsize(mp3) == 0:
-                continue
-
             for n in range(repeat):
-                ok = await _play_file(vc, mp3)
+                ok = await _play_file(vc, play_path)
                 print(f"🔊 [{unit.display_name()}] พูด ({n+1}/{repeat})" + ("" if ok else " (error)"), flush=True)
                 if n < repeat - 1:
                     await asyncio.sleep(0.8)
@@ -623,11 +647,12 @@ async def speak_worker(unit: BotUnit):
                     unit.current_room = ""
             except Exception:
                 unit.current_room = ""
-            if mp3 and os.path.exists(mp3):
-                try:
-                    os.remove(mp3)
-                except Exception:
-                    pass
+            for pth in (mp3, (mp3[:-4] + ".ogg") if mp3 else None):
+                if pth and os.path.exists(pth):
+                    try:
+                        os.remove(pth)
+                    except Exception:
+                        pass
             unit.queue.task_done()
 
 
