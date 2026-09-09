@@ -66,7 +66,7 @@ def _check_dave():
               f"แก้ requirements.txt เป็น discord.py[voice]>=2.7.1 แล้ว redeploy", flush=True)
 
 
-async def _wait_dave_ready(vc, timeout=8.0):
+async def _wait_dave_ready(vc, timeout=15.0):
     """รอให้ voice client ต่อเสร็จ + DAVE session พร้อมเข้ารหัส ก่อนเล่นเสียง (กันพูดแล้วเงียบ)"""
     t0 = time.monotonic()
     while time.monotonic() - t0 < timeout:
@@ -492,6 +492,24 @@ async def schedule_loop():
             await dispatch_jobs(jobs)
 
 
+async def _connect_retry(unit, ch, tries=3):
+    last = None
+    for i in range(tries):
+        try:
+            return await ch.connect(reconnect=True, self_deaf=True, timeout=30)
+        except (asyncio.TimeoutError, TimeoutError, discord.ClientException) as e:
+            last = e
+            print(f"⚠️ [{unit.display_name()}] ต่อห้อง {ch.name} ไม่ติด (ครั้งที่ {i+1}/{tries}): {type(e).__name__} — ลองใหม่", flush=True)
+            # เคลียร์ voice client ค้าง แล้วรอสักครู่ก่อนต่อใหม่
+            for old in list(unit.client.voice_clients):
+                try:
+                    await old.disconnect(force=True)
+                except Exception:
+                    pass
+            await asyncio.sleep(3)
+    raise last
+
+
 # ---------- play helpers ----------
 async def _play_file(vc, path):
     while vc.is_playing():
@@ -544,21 +562,15 @@ async def speak_worker(unit: BotUnit):
                         await vc.move_to(ch)          # เซิร์ฟเวอร์เดียวกัน → ย้ายห้องเลย (เร็ว)
                     else:
                         await vc.disconnect(force=True)  # คนละเซิร์ฟเวอร์ → ต้องออกก่อนค่อยเข้าใหม่
-                        vc = await ch.connect(reconnect=True, self_deaf=True)
+                        await asyncio.sleep(1)
+                        vc = await _connect_retry(unit, ch)
             else:
-                vc = await ch.connect(reconnect=True, self_deaf=True)
+                vc = await _connect_retry(unit, ch)
             unit.current_room = ch.name
             print(f"✅ [{unit.display_name()}] เข้าห้อง: {ch.name}", flush=True)
 
             # 🔐 รอให้ DAVE (E2EE) พร้อมก่อนพูด — ถ้าไม่รอ เสียงชุดแรกจะถูกส่งแบบไม่เข้ารหัสแล้วเงียบ
-            if not await _wait_dave_ready(vc):
-                # ลองต่อใหม่อีกครั้ง (บางทีต่อครั้งแรกค้าง)
-                try:
-                    await vc.disconnect(force=True)
-                except Exception:
-                    pass
-                vc = await ch.connect(reconnect=True, self_deaf=True, timeout=20)
-                await _wait_dave_ready(vc)
+            await _wait_dave_ready(vc)
 
             # เสียงเตือน
             if cfg.get("chime_enabled") and CHIME_PATH:
