@@ -24,11 +24,13 @@ import asyncio
 import ctypes.util
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
+import unicodedata
 from datetime import datetime, timedelta, timezone
 
 import discord
@@ -496,21 +498,41 @@ async def schedule_loop():
             await dispatch_jobs(jobs)
 
 
+# บอททุกตัวใช้ประตูเดียวกันตอนต่อห้องเสียง — ต่อทีละตัว ไม่ให้ 5 ตัวยิงพร้อมกันจน Discord ปฏิเสธ
+_VOICE_GATE = asyncio.Semaphore(1)
+
+
+async def _wait_connected(vc, timeout=10.0):
+    """หลัง connect() คืนค่ามาแล้ว ยังต้องรอ websocket เสียงเปิดจริง ไม่งั้นจะเจอ 'Not connected to voice'"""
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < timeout:
+        if vc.is_connected():
+            return True
+        await asyncio.sleep(0.2)
+    return False
+
+
 async def _connect_retry(unit, ch, tries=3):
     last = None
     for i in range(tries):
         try:
-            return await ch.connect(reconnect=True, self_deaf=True, timeout=30)
-        except (asyncio.TimeoutError, TimeoutError, discord.ClientException) as e:
+            async with _VOICE_GATE:
+                vc = await ch.connect(reconnect=True, self_deaf=True, timeout=30)
+                if await _wait_connected(vc):
+                    await asyncio.sleep(0.3)   # เว้นจังหวะให้ตัวถัดไป ไม่ยิงติดกันเกินไป
+                    return vc
+                last = discord.ClientException("connected แต่ websocket เสียงไม่เปิด")
+                print(f"⚠️ [{unit.display_name()}] ต่อห้อง {ch.name} แล้วแต่ยังไม่พร้อม (ครั้งที่ {i+1}/{tries}) — ลองใหม่", flush=True)
+        except (asyncio.TimeoutError, TimeoutError, discord.ClientException, discord.ConnectionClosed) as e:
             last = e
             print(f"⚠️ [{unit.display_name()}] ต่อห้อง {ch.name} ไม่ติด (ครั้งที่ {i+1}/{tries}): {type(e).__name__} — ลองใหม่", flush=True)
-            # เคลียร์ voice client ค้าง แล้วรอสักครู่ก่อนต่อใหม่
-            for old in list(unit.client.voice_clients):
-                try:
-                    await old.disconnect(force=True)
-                except Exception:
-                    pass
-            await asyncio.sleep(3)
+        # เคลียร์ voice client ค้าง แล้วรอ (ถอยนานขึ้นเรื่อยๆ) ก่อนต่อใหม่
+        for old in list(unit.client.voice_clients):
+            try:
+                await old.disconnect(force=True)
+            except Exception:
+                pass
+        await asyncio.sleep(2 + i * 3)
     raise last
 
 
@@ -598,7 +620,16 @@ async def speak_worker(unit: BotUnit):
                 vc = existing
                 if vc.channel.id != room_id:
                     if vc.channel.guild.id == ch.guild.id:
-                        await vc.move_to(ch)          # เซิร์ฟเวอร์เดียวกัน → ย้ายห้องเลย (เร็ว)
+                        try:
+                            await vc.move_to(ch)      # เซิร์ฟเวอร์เดียวกัน → ย้ายห้องเลย (เร็ว)
+                            if not await _wait_connected(vc, 8):
+                                raise discord.ClientException("ย้ายห้องแล้วเสียงไม่ต่อ")
+                        except Exception:
+                            try:
+                                await vc.disconnect(force=True)
+                            except Exception:
+                                pass
+                            vc = await _connect_retry(unit, ch)
                     else:
                         await vc.disconnect(force=True)  # คนละเซิร์ฟเวอร์ → ต้องออกก่อนค่อยเข้าใหม่
                         await asyncio.sleep(1)
@@ -610,6 +641,12 @@ async def speak_worker(unit: BotUnit):
 
             # 🔐 รอให้ DAVE (E2EE) พร้อมก่อนพูด — ถ้าไม่รอ เสียงชุดแรกจะถูกส่งแบบไม่เข้ารหัสแล้วเงียบ
             await _wait_dave_ready(vc)
+
+            # เช็คอีกรอบก่อนพูด — ถ้าหลุดระหว่างนี้ให้ต่อใหม่ (กัน 'Not connected to voice')
+            if not vc.is_connected():
+                print(f"⚠️ [{unit.display_name()}] เสียงหลุดก่อนพูด — ต่อห้องใหม่", flush=True)
+                vc = await _connect_retry(unit, ch)
+                await _wait_dave_ready(vc)
 
             # เสียงเตือน
             if cfg.get("chime_enabled") and CHIME_PATH:
@@ -679,16 +716,37 @@ async def telegram_list_loop():
     await _publish_telegram_list()
 
 
+_ZW = dict.fromkeys(map(ord, "\u200b\u200c\u200d\u200e\u200f\ufeff\u00ad\ufe0e\ufe0f"), None)
+
+
+def _norm_text(t: str) -> str:
+    """ทำข้อความให้เทียบกันได้ — บอท Telegram มักพิมพ์ช่องว่างไม่เหมือนคน (NBSP, zero-width,
+    วงเล็บเต็มความกว้าง, อีโมจิคั่น) ทำให้ 'คำที่ตั้งไว้' หาไม่เจอทั้งที่ตาเรามองว่าเหมือนกัน"""
+    t = unicodedata.normalize("NFKC", t or "")
+    t = t.translate(_ZW)
+    t = t.replace("\u00a0", " ").replace("\u202f", " ").replace("\u2009", " ")
+    # ทำให้ตัวคั่นเวลาเป็นแบบเดียวกันหมด: 08.00 / 08:00 / 08：00 / 08-00 → 08:00
+    t = re.sub(r"(?<=\d)\s*[.:：ː∶﹕·•]\s*(?=\d)", ":", t)
+    # ขีดคั่นช่วงเวลาแบบต่างๆ (– — ~ ถึง) → -
+    t = re.sub(r"\s*[-–—−~〜]\s*", "-", t)
+    # ช่องว่างติดวงเล็บ: "กะเช้า (08:00" กับ "กะเช้า(08:00" ให้ถือว่าเหมือนกัน
+    t = re.sub(r"\s*([()\[\]{}])\s*", r"\1", t)
+    t = re.sub(r"\s+", " ", t)
+    return t.strip().lower()
+
+
 async def start_telegram():
     await tg_client.start()
     me = await tg_client.get_me()
     print(f"✅ Telegram ล็อกอิน: {me.first_name}", flush=True)
 
     @tg_client.on(events.NewMessage())
+    @tg_client.on(events.MessageEdited())      # บอท Telegram หลายตัวส่งข้อความเปล่าแล้วค่อยแก้เนื้อหา
     async def handler(event):
         raw = (event.raw_text or "").strip()
         if not raw or not (event.is_group or event.is_channel):
             return
+        raw_n = _norm_text(raw)
         try:
             chat = await event.get_chat()
             title = getattr(chat, "title", "") or ""
@@ -709,11 +767,16 @@ async def start_telegram():
                 matched = True
             if not matched:
                 continue
+            hit_any = False
+            tried = []
             for sh in grp.get("shifts") or []:
                 if not sh.get("enabled"):
                     continue
                 kw = (sh.get("keyword") or "").strip()
-                if not kw or kw not in raw:
+                if not kw:
+                    continue
+                if kw not in raw and _norm_text(kw) not in raw_n:
+                    tried.append(kw)
                     continue
                 # ช่วงเวลาทำงานของกะ
                 if not _in_window(now_hm, (sh.get("active_start") or "").strip(), (sh.get("active_end") or "").strip()):
@@ -737,7 +800,19 @@ async def start_telegram():
                     "room_id": rid, "text": txt, "voice_name": voice, "repeat": repeat, "bot_id": bid,
                     "log": {"kind": "จับคำ", "group": title, "shift": sh.get("name"), "keyword": kw},
                 } for rid, txt, bid in triples]
+                hit_any = True
                 await dispatch_jobs(jobs)
+
+            if not hit_any:
+                who = "?"
+                try:
+                    snd = await event.get_sender()
+                    who = getattr(snd, "username", None) or getattr(snd, "first_name", None) or "?"
+                    if getattr(snd, "bot", False):
+                        who += " (bot)"
+                except Exception:
+                    pass
+                print(f"[ไม่ตรงคำ] กลุ่ม='{title}' จาก={who} คำที่ตั้งไว้={tried} | ข้อความ: {raw_n[:80]}", flush=True)
 
     print("✅ พร้อมฟังข้อความแล้ว", flush=True)
 
