@@ -162,7 +162,8 @@ cfg = {"speech_rate": "-15%", "chime_enabled": True, "dedupe_seconds": 60,
        "groups": [], "schedules": [], "bots": [], "dispatch_mode": "auto"}
 
 _last_cmd_id = ""
-_dedupe = {}            # (group,shift,kw) -> ts
+_dedupe = {}            # (group,shift,kw,ข้อความ) -> ts  (นับเฉพาะข้อความ "เดิมเป๊ะ" ว่าซ้ำ
+                        #  ประกาศ รอบที่ 1 / รอบที่ 2 = คนละข้อความ จะไม่โดนข้าม)
 _sched_fired = {}       # index -> "YYYY-MM-DD HH:MM"
 _logs_has_bot_col = True   # ถ้าตาราง tts_logs ยังไม่มีคอลัมน์ bot_name จะ fallback อัตโนมัติ
 
@@ -783,7 +784,7 @@ async def start_telegram():
                     print(f"[ข้ามนอกเวลา] กะ='{sh.get('name')}' ({sh.get('active_start')}-{sh.get('active_end')})", flush=True)
                     continue
                 # กันจับซ้ำ
-                dk = (gname, sh.get("name"), kw)
+                dk = (gname, sh.get("name"), kw, raw_n[:200])
                 if dedupe_sec > 0 and (time.time() - _dedupe.get(dk, 0)) < dedupe_sec:
                     print(f"[ข้ามซ้ำ] กะ='{sh.get('name')}' คำ='{kw}'", flush=True)
                     continue
@@ -803,7 +804,7 @@ async def start_telegram():
                 hit_any = True
                 await dispatch_jobs(jobs)
 
-            if not hit_any:
+            if not hit_any and tried:
                 who = "?"
                 try:
                     snd = await event.get_sender()
