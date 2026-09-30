@@ -162,6 +162,7 @@ cfg = {"speech_rate": "-15%", "chime_enabled": True, "dedupe_seconds": 60,
        "groups": [], "schedules": [], "bots": [], "dispatch_mode": "auto"}
 
 _last_cmd_id = ""
+_seen_msgs = {}         # (chat_id, message_id) -> ts  กันข้อความเดียวถูกประมวลผล 2 รอบ
 _dedupe = {}            # (group,shift,kw,ข้อความ) -> ts  (นับเฉพาะข้อความ "เดิมเป๊ะ" ว่าซ้ำ
                         #  ประกาศ รอบที่ 1 / รอบที่ 2 = คนละข้อความ จะไม่โดนข้าม)
 _sched_fired = {}       # index -> "YYYY-MM-DD HH:MM"
@@ -748,6 +749,22 @@ async def start_telegram():
         if not raw or not (event.is_group or event.is_channel):
             return
         raw_n = _norm_text(raw)
+
+        # กันซ้ำระดับ "ข้อความเดียวกัน" — ทำงานเสมอ ไม่เกี่ยวกับค่ากันซ้ำในเว็บ
+        # (ข้อความเดียวอาจเข้ามา 2 ครั้ง: ตอนส่ง + ตอนบอทแก้ข้อความ ทำให้พูดซ้ำ)
+        try:
+            mkey = (int(event.chat_id), int(event.id))
+        except Exception:
+            mkey = None
+        if mkey:
+            nowts = time.time()
+            for k, ts in list(_seen_msgs.items()):
+                if nowts - ts > 900:
+                    _seen_msgs.pop(k, None)
+            if mkey in _seen_msgs:
+                return
+            _seen_msgs[mkey] = nowts
+
         try:
             chat = await event.get_chat()
             title = getattr(chat, "title", "") or ""
