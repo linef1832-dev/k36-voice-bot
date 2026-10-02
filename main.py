@@ -21,6 +21,7 @@ Config เก็บใน Supabase settings (key = tts_voice_config)
 """
 
 import asyncio
+import contextlib
 import ctypes.util
 import json
 import os
@@ -495,8 +496,19 @@ async def schedule_loop():
             await dispatch_jobs(jobs)
 
 
-# บอททุกตัวใช้ประตูเดียวกันตอนต่อห้องเสียง — ต่อทีละตัว ไม่ให้ 5 ตัวยิงพร้อมกันจน Discord ปฏิเสธ
-_VOICE_GATE = asyncio.Semaphore(1)
+# ต่อห้องเสียงพร้อมกันกี่ตัว: 0 = ไม่จำกัด (ทุกตัวพุ่งเข้าห้องพร้อมกัน) ← ค่าเริ่มต้น
+# ตั้ง VOICE_CONCURRENCY=3 ใน Railway ถ้าอยากจำกัด (ช้าลงแต่เสี่ยง TimeoutError น้อยลง)
+_VC_LIMIT = int(os.getenv("VOICE_CONCURRENCY", "0") or 0)
+_VOICE_GATE = asyncio.Semaphore(_VC_LIMIT) if _VC_LIMIT > 0 else contextlib.nullcontext()
+
+
+@contextlib.asynccontextmanager
+async def _vc_gate():
+    if _VC_LIMIT > 0:
+        async with _VOICE_GATE:
+            yield
+    else:
+        yield
 
 
 async def _wait_connected(vc, timeout=10.0):
@@ -513,10 +525,9 @@ async def _connect_retry(unit, ch, tries=3):
     last = None
     for i in range(tries):
         try:
-            async with _VOICE_GATE:
+            async with _vc_gate():
                 vc = await ch.connect(reconnect=True, self_deaf=True, timeout=30)
                 if await _wait_connected(vc):
-                    await asyncio.sleep(0.3)   # เว้นจังหวะให้ตัวถัดไป ไม่ยิงติดกันเกินไป
                     return vc
                 last = discord.ClientException("connected แต่ websocket เสียงไม่เปิด")
                 print(f"⚠️ [{unit.display_name()}] ต่อห้อง {ch.name} แล้วแต่ยังไม่พร้อม (ครั้งที่ {i+1}/{tries}) — ลองใหม่", flush=True)
