@@ -68,7 +68,7 @@ def _check_dave():
               f"แก้ requirements.txt เป็น discord.py[voice]>=2.7.1 แล้ว redeploy", flush=True)
 
 
-async def _wait_dave_ready(vc, timeout=3.0):
+async def _wait_dave_ready(vc, timeout=1.0):
     """รอให้ voice client ต่อเสร็จ + DAVE session พร้อมเข้ารหัส ก่อนเล่นเสียง (กันพูดแล้วเงียบ)"""
     t0 = time.monotonic()
     while time.monotonic() - t0 < timeout:
@@ -83,11 +83,6 @@ async def _wait_dave_ready(vc, timeout=3.0):
             if ver == 0 and conn.dave_session is None and time.monotonic() - t0 > 2.0:
                 return True               # ห้องนี้ไม่ใช้ E2EE (เช่น Stage) — ไปต่อได้
         await asyncio.sleep(0.1)
-    conn = getattr(vc, "_connection", None)
-    sess = getattr(conn, "dave_session", None)
-    print(f"⚠️ รอ DAVE พร้อมเกินเวลา (ver={getattr(conn, 'dave_protocol_version', '?')} "
-          f"session={'มี' if sess else 'ไม่มี'} ready={getattr(sess, 'ready', '?')} "
-          f"connected={vc.is_connected()} คนในห้อง={len(getattr(vc.channel, 'members', []))}) — เล่นเสียงต่อ (ปกติถ้าบอทอยู่ในห้องคนเดียว)", flush=True)
     return False
 
 
@@ -538,6 +533,46 @@ async def _connect_retry(unit, ch, tries=3):
     raise last
 
 
+_tts_cache = {}         # (text,voice,rate) -> (path, ts)
+_tts_locks = {}
+
+
+async def _tts_cached(text, voice, rate, unit):
+    """ประกาศเดียวกันถูกส่งไปหลายห้องพร้อมกัน — สร้างเสียงครั้งเดียวแล้วใช้ร่วมกัน
+    (เดิมบอท 7 ตัวต่อสายไป edge-tts พร้อมกัน 8 ครั้ง ทำให้รอนานและเสี่ยงโดนจำกัดอัตรา)"""
+    key = (text, voice, rate)
+    now = time.time()
+    for k, (pth, ts) in list(_tts_cache.items()):
+        if now - ts > 600:
+            _tts_cache.pop(k, None)
+            for junk in (pth, pth[:-4] + ".mp3"):
+                try:
+                    os.remove(junk)
+                except Exception:
+                    pass
+    hit = _tts_cache.get(key)
+    if hit and os.path.exists(hit[0]):
+        return hit[0]
+
+    lock = _tts_locks.setdefault(key, asyncio.Lock())
+    async with lock:
+        hit = _tts_cache.get(key)
+        if hit and os.path.exists(hit[0]):
+            return hit[0]
+        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
+            mp3 = f.name
+        try:
+            await asyncio.wait_for(edge_tts.Communicate(text, voice, rate=rate).save(mp3), timeout=20)
+        except Exception as e:
+            print(f"❌ [{unit.display_name()}] สร้างเสียงไม่ได้: {e!r}", flush=True)
+            return None
+        if not os.path.exists(mp3) or os.path.getsize(mp3) == 0:
+            return None
+        path = await _mp3_to_opus(mp3) or mp3
+        _tts_cache[key] = (path, time.time())
+        return path
+
+
 # ---------- play helpers ----------
 async def _mp3_to_opus(mp3):
     """แปลง mp3 จาก edge-tts → Opus 48kHz ครั้งเดียวก่อนเล่น
@@ -583,7 +618,6 @@ async def speak_worker(unit: BotUnit):
     while True:
         job = await unit.queue.get()
         vc = None
-        mp3 = None
         try:
             if not unit.is_ready():
                 await unit.client.wait_until_ready()
@@ -595,17 +629,10 @@ async def speak_worker(unit: BotUnit):
             if not text:
                 continue
 
-            # สร้างเสียงพูด "ก่อน" เข้าห้อง → เข้าห้องปุ๊บพูดได้เลย และไม่กิน CPU ระหว่างอยู่ในห้อง
-            with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
-                mp3 = f.name
-            try:
-                await edge_tts.Communicate(text, voice, rate=rate).save(mp3)
-            except Exception as e:
-                print(f"❌ [{unit.display_name()}] สร้างเสียงไม่ได้: {e!r}", flush=True)
+            # สร้างเสียงพูด "ก่อน" เข้าห้อง และใช้ไฟล์ร่วมกันทุกห้องที่ข้อความเหมือนกัน
+            play_path = await _tts_cached(text, voice, rate, unit)
+            if not play_path:
                 continue
-            if not os.path.exists(mp3) or os.path.getsize(mp3) == 0:
-                continue
-            play_path = await _mp3_to_opus(mp3) or mp3
 
             ch = unit.client.get_channel(room_id)
             if ch is None:
@@ -690,12 +717,7 @@ async def speak_worker(unit: BotUnit):
                     unit.current_room = ""
             except Exception:
                 unit.current_room = ""
-            for pth in (mp3, (mp3[:-4] + ".ogg") if mp3 else None):
-                if pth and os.path.exists(pth):
-                    try:
-                        os.remove(pth)
-                    except Exception:
-                        pass
+            pass   # ไฟล์เสียงใช้ร่วมกันหลายห้อง ปล่อยให้ _tts_cached เก็บกวาดเอง
             unit.queue.task_done()
 
 
