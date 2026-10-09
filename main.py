@@ -770,6 +770,25 @@ def _norm_text(t: str) -> str:
     return t.strip().lower()
 
 
+def _split_keywords(val) -> list:
+    """คำที่จับใส่ได้หลายคำในช่องเดียว — ขึ้นบรรทัดใหม่ หรือคั่นด้วย | (หรือส่งมาเป็น list ก็ได้)
+    เช่น  กะเช้า(08.00-20.00 น.)
+          กะเช้า(08:00-20:00 น.)
+          กะเช้ารอบ
+    คำไหนเจอก่อนก็ถือว่าตรง ใช้พูดได้เลย"""
+    if isinstance(val, (list, tuple)):
+        items = list(val)
+    else:
+        items = re.split(r"[\n\r|]+", str(val or ""))
+    out, seen = [], set()
+    for it in items:
+        it = str(it).strip()
+        if it and it not in seen:
+            seen.add(it)
+            out.append(it)
+    return out
+
+
 async def start_telegram():
     await tg_client.start()
     me = await tg_client.get_me()
@@ -827,11 +846,14 @@ async def start_telegram():
             for sh in grp.get("shifts") or []:
                 if not sh.get("enabled"):
                     continue
-                kw = (sh.get("keyword") or "").strip()
-                if not kw:
+                # ใส่ได้หลายคำ: ขึ้นบรรทัดใหม่ หรือคั่นด้วย | — เจอคำไหนก่อนก็พูด
+                kw_list = _split_keywords(sh.get("keyword"))
+                if not kw_list:
                     continue
-                if kw not in raw and _norm_text(kw) not in raw_n:
-                    tried.append(kw)
+                kw = next((k for k in kw_list
+                           if k in raw or _norm_text(k) in raw_n), None)
+                if not kw:
+                    tried.extend(kw_list)
                     continue
                 # ช่วงเวลาทำงานของกะ
                 if not _in_window(now_hm, (sh.get("active_start") or "").strip(), (sh.get("active_end") or "").strip()):
