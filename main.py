@@ -158,7 +158,7 @@ cfg = {"speech_rate": "-15%", "chime_enabled": True, "dedupe_seconds": 60,
        "groups": [], "schedules": [], "bots": [], "dispatch_mode": "auto"}
 
 _last_cmd_id = ""
-_seen_msgs = {}         # (chat_id, message_id, เนื้อหา) -> ts  กันประมวลผลซ้ำ แต่ยอมให้ "ข้อความที่ถูกแก้" เข้าใหม่
+_seen_msgs = {}         # (chat_id, message_id) -> {ts, spoke, text}  กันพูดซ้ำจากข้อความชิ้นเดียวกัน
 _dedupe = {}            # (group,shift,kw,ข้อความ) -> ts  (นับเฉพาะข้อความ "เดิมเป๊ะ" ว่าซ้ำ
                         #  ประกาศ รอบที่ 1 / รอบที่ 2 = คนละข้อความ จะไม่โดนข้าม)
 _sched_fired = {}       # index -> "YYYY-MM-DD HH:MM"
@@ -783,22 +783,24 @@ async def start_telegram():
             return
         raw_n = _norm_text(raw)
 
-        # กันซ้ำระดับ "ข้อความ + เนื้อหา" — ทำงานเสมอ ไม่เกี่ยวกับค่ากันซ้ำในเว็บ
-        #  • ข้อความชิ้นเดิม เนื้อหาเดิม เข้ามา 2 รอบ (ตอนส่ง + ตอนแก้) → ข้าม ไม่พูดซ้ำ
-        #  • ข้อความชิ้นเดิม แต่ "แก้เนื้อหาใหม่" → ถือเป็นข้อความใหม่ อ่านใหม่ทั้งหมด
-        #    (เคสเขาพิมพ์ผิดแล้วมาแก้ทีหลัง บอทต้องจับได้)
+        # กันพูดซ้ำ — ยึดที่ "ข้อความชิ้นนี้เคยทำให้บอทพูดไปแล้วหรือยัง"
+        #  • เคยพูดไปแล้ว → แก้ข้อความอีกกี่รอบก็ไม่พูดซ้ำ
+        #  • ยังไม่เคยพูด (เช่น พิมพ์คำผิดตอนแรก) → พอแก้ให้ถูก บอทจะจับได้และพูด 1 ครั้ง
         try:
-            mkey = (int(event.chat_id), int(event.id), raw_n[:300])
+            mkey = (int(event.chat_id), int(event.id))
         except Exception:
             mkey = None
         if mkey:
             nowts = time.time()
-            for k, ts in list(_seen_msgs.items()):
-                if nowts - ts > 900:
+            for k, v in list(_seen_msgs.items()):
+                if nowts - v["ts"] > 3600:
                     _seen_msgs.pop(k, None)
-            if mkey in _seen_msgs:
+            rec = _seen_msgs.get(mkey)
+            if rec and rec["spoke"]:
                 return
-            _seen_msgs[mkey] = nowts
+            if rec and rec.get("text") == raw_n[:300]:
+                return                      # เนื้อหาเดิมเป๊ะ เข้ามาซ้ำ ไม่ต้องอ่านใหม่
+            _seen_msgs[mkey] = {"ts": nowts, "spoke": False, "text": raw_n[:300]}
 
         try:
             chat = await event.get_chat()
@@ -854,6 +856,8 @@ async def start_telegram():
                     "log": {"kind": "จับคำ", "group": title, "shift": sh.get("name"), "keyword": kw},
                 } for rid, txt, bid in triples]
                 hit_any = True
+                if mkey:
+                    _seen_msgs.setdefault(mkey, {"ts": time.time(), "text": raw_n[:300]})["spoke"] = True
                 await dispatch_jobs(jobs)
 
             if not hit_any and tried:
