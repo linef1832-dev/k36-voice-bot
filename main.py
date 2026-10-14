@@ -572,10 +572,23 @@ async def _tts_cached(text, voice, rate, unit):
             return hit[0]
         with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
             mp3 = f.name
-        try:
-            await asyncio.wait_for(edge_tts.Communicate(text, voice, rate=rate).save(mp3), timeout=20)
-        except Exception as e:
-            print(f"❌ [{unit.display_name()}] สร้างเสียงไม่ได้: {e!r}", flush=True)
+        last_err = None
+        for attempt in range(3):          # บริการของ Microsoft เด้ง 403 เป็นช่วงๆ — ลองใหม่สัก 2-3 ครั้ง
+            try:
+                await asyncio.wait_for(edge_tts.Communicate(text, voice, rate=rate).save(mp3), timeout=25)
+                last_err = None
+                break
+            except Exception as e:
+                last_err = e
+                if attempt < 2:
+                    await asyncio.sleep(1.5 * (attempt + 1))
+        if last_err is not None:
+            msg = str(last_err)
+            if "403" in msg:
+                print(f"❌ [{unit.display_name()}] สร้างเสียงไม่ได้: Microsoft ปฏิเสธ (403) — "
+                      f"ต้องอัปเกรด edge-tts เป็น 7.3.1 ขึ้นไป แล้ว redeploy", flush=True)
+            else:
+                print(f"❌ [{unit.display_name()}] สร้างเสียงไม่ได้: {type(last_err).__name__}: {msg[:160]}", flush=True)
             return None
         if not os.path.exists(mp3) or os.path.getsize(mp3) == 0:
             return None
