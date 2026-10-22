@@ -764,6 +764,40 @@ async def telegram_list_loop():
     await _publish_telegram_list()
 
 
+_last_tg_update = 0.0          # เวลาล่าสุดที่ "มีข้อความจาก Telegram เข้ามาจริง"
+
+
+@tasks.loop(minutes=2)
+async def telegram_watchdog():
+    """บางครั้ง Telethon ยังต่ออยู่ (ดึงรายชื่อกลุ่มได้) แต่สายรับข้อความตายเงียบๆ
+    ผลคือบอทไม่รู้เลยว่ามีประกาศเข้ามา — ถ้าเงียบนานผิดปกติให้ต่อใหม่"""
+    global _last_tg_update
+    if not _last_tg_update:
+        _last_tg_update = time.time()
+        return
+    idle = time.time() - _last_tg_update
+    if idle < 1800:            # 30 นาที
+        return
+    print(f"⚠️ ไม่ได้รับข้อความ Telegram มา {int(idle/60)} นาที — ต่อใหม่", flush=True)
+    try:
+        await tg_client.disconnect()
+    except Exception:
+        pass
+    try:
+        await tg_client.connect()
+        if not await tg_client.is_user_authorized():
+            print("❌ ต่อ Telegram ใหม่แล้วแต่ session หมดอายุ — ต้องสร้าง TG_SESSION ใหม่", flush=True)
+        else:
+            try:
+                await tg_client.catch_up()
+            except Exception:
+                pass
+            _last_tg_update = time.time()
+            print("✅ ต่อ Telegram ใหม่เรียบร้อย", flush=True)
+    except Exception as e:
+        print(f"❌ ต่อ Telegram ใหม่ไม่สำเร็จ: {type(e).__name__}: {e}", flush=True)
+
+
 _ZW = dict.fromkeys(map(ord, "\u200b\u200c\u200d\u200e\u200f\ufeff\u00ad\ufe0e\ufe0f"), None)
 
 
@@ -810,6 +844,8 @@ async def start_telegram():
     @tg_client.on(events.NewMessage())
     @tg_client.on(events.MessageEdited())      # บอท Telegram หลายตัวส่งข้อความเปล่าแล้วค่อยแก้เนื้อหา
     async def handler(event):
+        global _last_tg_update
+        _last_tg_update = time.time()          # มีสัญญาณชีพจาก Telegram แล้ว
         raw = (event.raw_text or "").strip()
         if not raw or not (event.is_group or event.is_channel):
             return
@@ -906,6 +942,10 @@ async def start_telegram():
                     pass
                 print(f"[ไม่ตรงคำ] กลุ่ม='{title}' จาก={who} คำที่ตั้งไว้={tried} | ข้อความ: {raw_n[:80]}", flush=True)
 
+    global _last_tg_update
+    _last_tg_update = time.time()
+    if not telegram_watchdog.is_running():
+        telegram_watchdog.start()
     print("✅ พร้อมฟังข้อความแล้ว", flush=True)
 
 
