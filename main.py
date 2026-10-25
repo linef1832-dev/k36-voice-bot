@@ -439,6 +439,8 @@ async def config_loop():
         txt = (cmd.get("text") or "").strip()
         if rid and txt:
             print(f"[ทดสอบ] ห้อง={rid} บอท={cmd.get('bot_id') or 'auto'}", flush=True)
+            # ปุ่มทดสอบไม่มีข้อความจริงจากกลุ่ม จึงไม่มีเลขให้เติม — ใส่เลขตัวอย่างให้ฟังรู้เรื่อง
+            txt = _fill_placeholders(txt, "", "", ["100", "10,000", "1,000", "500", "50,000"])
             await dispatch_jobs([{
                 "room_id": rid, "text": txt,
                 "voice_name": cmd.get("voice_name") or "th-TH-PremwadeeNeural",
@@ -549,9 +551,21 @@ _tts_cache = {}         # (text,voice,rate) -> (path, ts)
 _tts_locks = {}
 
 
+def _clean_for_tts(t: str) -> str:
+    """เอา {…} ที่ยังเติมไม่ได้ออกก่อนส่งให้ edge-tts
+    (ถ้าปล่อยไว้ บริการจะตอบกลับมาเป็นเสียงเปล่า → NoAudioReceived)"""
+    t = re.sub(r"\{[^}]{0,20}\}", " ", t or "")
+    t = re.sub(r"[ \t]{2,}", " ", t)
+    return t.strip()
+
+
 async def _tts_cached(text, voice, rate, unit):
     """ประกาศเดียวกันถูกส่งไปหลายห้องพร้อมกัน — สร้างเสียงครั้งเดียวแล้วใช้ร่วมกัน
     (เดิมบอท 7 ตัวต่อสายไป edge-tts พร้อมกัน 8 ครั้ง ทำให้รอนานและเสี่ยงโดนจำกัดอัตรา)"""
+    text = _clean_for_tts(text)
+    if not text:
+        print(f"⛔ [{unit.display_name()}] ข้อความว่างหลังเติมค่า — ไม่พูด", flush=True)
+        return None
     key = (text, voice, rate)
     now = time.time()
     for k, (pth, ts) in list(_tts_cache.items()):
