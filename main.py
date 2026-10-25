@@ -830,7 +830,26 @@ def _norm_text(t: str) -> str:
 _NUM_RE = re.compile(r"\d[\d,\.]*")
 
 
-def _fill_placeholders(text: str, kw: str, msg: str) -> str:
+def _kw_match(kw: str, raw: str, raw_n: str):
+    """เทียบคำที่ตั้งไว้กับข้อความ — รองรับ * แทน "ตัวเลขอะไรก็ได้"
+    เช่นตั้งว่า  ระบบถอนปกติ ขั้นต่ำ * - *
+    จะจับได้ทุกแบบ: 300 - 20,000 / 100 - 100,000 / 500 - 10,000 …
+    และตัวเลขที่จับได้จะกลายเป็น {1} {2} ให้ใช้ในข้อความพูดทันที
+    คืนค่า (ตรงไหม, [ตัวเลขที่จับได้])"""
+    if "*" in kw:
+        kn = _norm_text(kw)
+        parts = [re.escape(p) for p in kn.split("*")]
+        pattern = r"(\d[\d,\.]*)".join(parts)
+        m = re.search(pattern, raw_n)
+        if m:
+            return True, [g for g in m.groups()]
+        return False, []
+    if kw in raw or _norm_text(kw) in raw_n:
+        return True, _NUM_RE.findall(kw)
+    return False, []
+
+
+def _fill_placeholders(text: str, kw: str, msg: str, kw_nums=None) -> str:
     """เติมช่องว่างในข้อความอัตโนมัติ — จะได้ไม่ต้องพิมพ์ข้อความทีละคำ
        {1} {2} {3} … = ตัวเลขตัวที่ 1,2,3 ในคำที่จับได้
        {ค1} {ค2} …   = ตัวเลขในข้อความจริงที่ส่งเข้ามาในกลุ่ม
@@ -839,7 +858,7 @@ def _fill_placeholders(text: str, kw: str, msg: str) -> str:
               ข้อความ='ถอนเงินได้ {1} ถึง {2} บาท'  →  'ถอนเงินได้ 500 ถึง 10,000 บาท'"""
     if not text or "{" not in text:
         return text
-    kw_nums = _NUM_RE.findall(kw or "")
+    kw_nums = list(kw_nums) if kw_nums is not None else _NUM_RE.findall(kw or "")
     msg_nums = _NUM_RE.findall(msg or "")
 
     def pick(m):
@@ -950,8 +969,12 @@ async def start_telegram():
                 kw_list = _split_keywords(sh.get("keyword"))
                 if not kw_list:
                     continue
-                kw_i, kw = next(((i, k) for i, k in enumerate(kw_list)
-                                 if k in raw or _norm_text(k) in raw_n), (-1, None))
+                kw_i, kw, kw_nums = -1, None, []
+                for i, k in enumerate(kw_list):
+                    hit, nums = _kw_match(k, raw, raw_n)
+                    if hit:
+                        kw_i, kw, kw_nums = i, k, nums
+                        break
                 if not kw:
                     tried.extend(kw_list)
                     continue
@@ -966,7 +989,7 @@ async def start_telegram():
                     print(f"[ข้ามนอกเวลา] กะ='{sh.get('name')}' ({sh.get('active_start')}-{sh.get('active_end')})", flush=True)
                     continue
                 # กันจับซ้ำ
-                dk = (gname, sh.get("name"), kw, raw_n[:200])
+                dk = (gname, sh.get("name"), kw, tuple(kw_nums), raw_n[:200])
                 if dedupe_sec > 0 and (time.time() - _dedupe.get(dk, 0)) < dedupe_sec:
                     print(f"[ข้ามซ้ำ] กะ='{sh.get('name')}' คำ='{kw}'", flush=True)
                     continue
@@ -980,7 +1003,7 @@ async def start_telegram():
                 n_bots = len(_online_units()) or 1
                 print(f"[ตรงคำ] กลุ่ม='{title}' กะ='{sh.get('name')}' คำ='{kw}' ห้อง={len(triples)} รอบ={repeat} บอทออนไลน์={n_bots}", flush=True)
                 jobs = [{
-                    "room_id": rid, "text": _fill_placeholders(kw_text or txt, kw, raw), "voice_name": voice,
+                    "room_id": rid, "text": _fill_placeholders(kw_text or txt, kw, raw, kw_nums), "voice_name": voice,
                     "repeat": repeat, "bot_id": bid,
                     "log": {"kind": "จับคำ", "group": title, "shift": sh.get("name"), "keyword": kw},
                 } for rid, txt, bid in triples]
