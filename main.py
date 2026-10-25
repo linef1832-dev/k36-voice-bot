@@ -765,6 +765,16 @@ async def telegram_list_loop():
 
 
 _last_tg_update = 0.0          # เวลาล่าสุดที่ "มีข้อความจาก Telegram เข้ามาจริง"
+_tg_raw_count = 0              # นับสัญญาณดิบทุกชนิดที่ Telegram ส่งมา
+_tg_msg_count = 0              # นับเฉพาะข้อความในกลุ่มที่บอทอ่านจริง
+
+
+@tasks.loop(minutes=5)
+async def telegram_pulse():
+    """พิมพ์ชีพจรฝั่ง Telegram ไว้ดูว่า 'ไม่มีข้อความ' เพราะไม่มีใครพิมพ์ หรือเพราะสายขาด"""
+    idle = int((time.time() - _last_tg_update) / 60) if _last_tg_update else -1
+    print(f"💓 Telegram: สัญญาณดิบ {_tg_raw_count} ครั้ง | ข้อความกลุ่ม {_tg_msg_count} ครั้ง | "
+          f"เงียบมา {idle} นาที | ต่ออยู่={tg_client.is_connected()}", flush=True)
 
 
 @tasks.loop(minutes=2)
@@ -776,7 +786,7 @@ async def telegram_watchdog():
         _last_tg_update = time.time()
         return
     idle = time.time() - _last_tg_update
-    if idle < 1800:            # 30 นาที
+    if idle < 900:             # 15 นาที
         return
     print(f"⚠️ ไม่ได้รับข้อความ Telegram มา {int(idle/60)} นาที — ต่อใหม่", flush=True)
     try:
@@ -841,11 +851,20 @@ async def start_telegram():
     me = await tg_client.get_me()
     print(f"✅ Telegram ล็อกอิน: {me.first_name}", flush=True)
 
+    @tg_client.on(events.Raw)
+    async def _raw_probe(update):
+        """ตัวดักสัญญาณดิบ — ถ้าบรรทัดนี้ขยับแต่ข้อความกลุ่มไม่ขยับ แปลว่าสายไม่ขาด
+        แต่ข้อความถูกกรองทิ้ง (เช่น ไม่ได้อยู่ในกลุ่มนั้น / กลุ่มไม่ตรง)"""
+        global _tg_raw_count, _last_tg_update
+        _tg_raw_count += 1
+        _last_tg_update = time.time()
+
     @tg_client.on(events.NewMessage())
     @tg_client.on(events.MessageEdited())      # บอท Telegram หลายตัวส่งข้อความเปล่าแล้วค่อยแก้เนื้อหา
     async def handler(event):
-        global _last_tg_update
+        global _last_tg_update, _tg_msg_count
         _last_tg_update = time.time()          # มีสัญญาณชีพจาก Telegram แล้ว
+        _tg_msg_count += 1
         raw = (event.raw_text or "").strip()
         if not raw or not (event.is_group or event.is_channel):
             return
@@ -899,11 +918,17 @@ async def start_telegram():
                 kw_list = _split_keywords(sh.get("keyword"))
                 if not kw_list:
                     continue
-                kw = next((k for k in kw_list
-                           if k in raw or _norm_text(k) in raw_n), None)
+                kw_i, kw = next(((i, k) for i, k in enumerate(kw_list)
+                                 if k in raw or _norm_text(k) in raw_n), (-1, None))
                 if not kw:
                     tried.extend(kw_list)
                     continue
+                # ข้อความเฉพาะของคำนี้ (ถ้าเปิด "ข้อความแยกตามคำ" ไว้ในเว็บ)
+                kw_text = ""
+                if sh.get("text_per_kw"):
+                    kt = sh.get("kw_texts") or []
+                    if 0 <= kw_i < len(kt):
+                        kw_text = (kt[kw_i] or "").strip()
                 # ช่วงเวลาทำงานของกะ
                 if not _in_window(now_hm, (sh.get("active_start") or "").strip(), (sh.get("active_end") or "").strip()):
                     print(f"[ข้ามนอกเวลา] กะ='{sh.get('name')}' ({sh.get('active_start')}-{sh.get('active_end')})", flush=True)
@@ -923,7 +948,7 @@ async def start_telegram():
                 n_bots = len(_online_units()) or 1
                 print(f"[ตรงคำ] กลุ่ม='{title}' กะ='{sh.get('name')}' คำ='{kw}' ห้อง={len(triples)} รอบ={repeat} บอทออนไลน์={n_bots}", flush=True)
                 jobs = [{
-                    "room_id": rid, "text": txt, "voice_name": voice, "repeat": repeat, "bot_id": bid,
+                    "room_id": rid, "text": (kw_text or txt), "voice_name": voice, "repeat": repeat, "bot_id": bid,
                     "log": {"kind": "จับคำ", "group": title, "shift": sh.get("name"), "keyword": kw},
                 } for rid, txt, bid in triples]
                 hit_any = True
@@ -946,6 +971,8 @@ async def start_telegram():
     _last_tg_update = time.time()
     if not telegram_watchdog.is_running():
         telegram_watchdog.start()
+    if not telegram_pulse.is_running():
+        telegram_pulse.start()
     print("✅ พร้อมฟังข้อความแล้ว", flush=True)
 
 
