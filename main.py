@@ -25,6 +25,7 @@ import contextlib
 import ctypes.util
 import json
 import os
+import random
 import re
 import shutil
 import subprocess
@@ -573,22 +574,25 @@ async def _tts_cached(text, voice, rate, unit):
         with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
             mp3 = f.name
         last_err = None
-        for attempt in range(3):          # บริการของ Microsoft เด้ง 403 เป็นช่วงๆ — ลองใหม่สัก 2-3 ครั้ง
+        for attempt in range(5):          # บริการของ Microsoft เด้งเป็นช่วงๆ (403 / NoAudioReceived) — ลองใหม่หลายรอบ
             try:
                 await asyncio.wait_for(edge_tts.Communicate(text, voice, rate=rate).save(mp3), timeout=25)
-                last_err = None
-                break
+                if os.path.exists(mp3) and os.path.getsize(mp3) > 0:
+                    last_err = None
+                    break
+                last_err = RuntimeError("ไฟล์เสียงว่าง")
             except Exception as e:
                 last_err = e
-                if attempt < 2:
-                    await asyncio.sleep(1.5 * (attempt + 1))
+            if attempt < 4:
+                await asyncio.sleep(1.2 * (attempt + 1) + random.uniform(0, 0.6))
         if last_err is not None:
             msg = str(last_err)
             if "403" in msg:
                 print(f"❌ [{unit.display_name()}] สร้างเสียงไม่ได้: Microsoft ปฏิเสธ (403) — "
                       f"ต้องอัปเกรด edge-tts เป็น 7.3.1 ขึ้นไป แล้ว redeploy", flush=True)
             else:
-                print(f"❌ [{unit.display_name()}] สร้างเสียงไม่ได้: {type(last_err).__name__}: {msg[:160]}", flush=True)
+                print(f"❌ [{unit.display_name()}] สร้างเสียงไม่ได้: {type(last_err).__name__}: {msg[:120]} "
+                      f"(ข้อความยาว {len(text)} ตัวอักษร)", flush=True)
             return None
         if not os.path.exists(mp3) or os.path.getsize(mp3) == 0:
             return None
@@ -656,6 +660,10 @@ async def speak_worker(unit: BotUnit):
             # สร้างเสียงพูด "ก่อน" เข้าห้อง และใช้ไฟล์ร่วมกันทุกห้องที่ข้อความเหมือนกัน
             play_path = await _tts_cached(text, voice, rate, unit)
             if not play_path:
+                await asyncio.sleep(2)
+                play_path = await _tts_cached(text, voice, rate, unit)   # ลองอีกหน (บอทตัวอื่นอาจสร้างสำเร็จแล้ว)
+            if not play_path:
+                print(f"⛔ [{unit.display_name()}] ข้ามห้องนี้ เพราะสร้างเสียงไม่สำเร็จ", flush=True)
                 continue
 
             ch = unit.client.get_channel(room_id)
