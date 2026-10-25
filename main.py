@@ -827,6 +827,38 @@ def _norm_text(t: str) -> str:
     return t.strip().lower()
 
 
+_NUM_RE = re.compile(r"\d[\d,\.]*")
+
+
+def _fill_placeholders(text: str, kw: str, msg: str) -> str:
+    """เติมช่องว่างในข้อความอัตโนมัติ — จะได้ไม่ต้องพิมพ์ข้อความทีละคำ
+       {1} {2} {3} … = ตัวเลขตัวที่ 1,2,3 ในคำที่จับได้
+       {ค1} {ค2} …   = ตัวเลขในข้อความจริงที่ส่งเข้ามาในกลุ่ม
+       {คำ}          = คำที่จับได้ทั้งคำ
+    ตัวอย่าง: คำ='ระบบถอนปกติ ขั้นต่ำ 500 - 10,000'
+              ข้อความ='ถอนเงินได้ {1} ถึง {2} บาท'  →  'ถอนเงินได้ 500 ถึง 10,000 บาท'"""
+    if not text or "{" not in text:
+        return text
+    kw_nums = _NUM_RE.findall(kw or "")
+    msg_nums = _NUM_RE.findall(msg or "")
+
+    def pick(m):
+        tok = m.group(1).strip()
+        if tok in ("คำ", "kw"):
+            return kw or ""
+        src, idx = (kw_nums, tok)
+        if tok[:1] in ("ค", "m"):
+            src, idx = msg_nums, tok[1:]
+        if idx.isdigit():
+            i = int(idx) - 1
+            if 0 <= i < len(src):
+                return src[i]
+            return ""
+        return m.group(0)
+
+    return re.sub(r"\{([^}]{1,6})\}", pick, text)
+
+
 def _split_keywords(val) -> list:
     """คำที่จับใส่ได้หลายคำในช่องเดียว — ขึ้นบรรทัดใหม่ หรือคั่นด้วย | (หรือส่งมาเป็น list ก็ได้)
     เช่น  กะเช้า(08.00-20.00 น.)
@@ -948,7 +980,8 @@ async def start_telegram():
                 n_bots = len(_online_units()) or 1
                 print(f"[ตรงคำ] กลุ่ม='{title}' กะ='{sh.get('name')}' คำ='{kw}' ห้อง={len(triples)} รอบ={repeat} บอทออนไลน์={n_bots}", flush=True)
                 jobs = [{
-                    "room_id": rid, "text": (kw_text or txt), "voice_name": voice, "repeat": repeat, "bot_id": bid,
+                    "room_id": rid, "text": _fill_placeholders(kw_text or txt, kw, raw), "voice_name": voice,
+                    "repeat": repeat, "bot_id": bid,
                     "log": {"kind": "จับคำ", "group": title, "shift": sh.get("name"), "keyword": kw},
                 } for rid, txt, bid in triples]
                 hit_any = True
