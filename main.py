@@ -857,16 +857,18 @@ def _kw_match(kw: str, raw: str, raw_n: str):
     เช่นตั้งว่า  ระบบถอนปกติ ขั้นต่ำ * - *
     จะจับได้ทุกแบบ: 300 - 20,000 / 100 - 100,000 / 500 - 10,000 …
     และตัวเลขที่จับได้จะกลายเป็น {1} {2} ให้ใช้ในข้อความพูดทันที
+
+    การเว้นวรรคไม่มีผล — จะเว้นเกิน เว้นขาด หรือไม่เว้นเลยก็จับได้เหมือนกัน
     คืนค่า (ตรงไหม, [ตัวเลขที่จับได้])"""
+    nospace = lambda t: re.sub(r"\s+", "", t)
     if "*" in kw:
-        kn = _norm_text(kw)
-        parts = [re.escape(p) for p in kn.split("*")]
+        parts = [re.escape(nospace(p)) for p in _norm_text(kw).split("*")]
         pattern = r"(\d[\d,\.]*)".join(parts)
-        m = re.search(pattern, raw_n)
+        m = re.search(pattern, nospace(raw_n))
         if m:
-            return True, [g for g in m.groups()]
+            return True, list(m.groups())
         return False, []
-    if kw in raw or _norm_text(kw) in raw_n:
+    if kw in raw or _norm_text(kw) in raw_n or nospace(_norm_text(kw)) in nospace(raw_n):
         return True, _NUM_RE.findall(kw)
     return False, []
 
