@@ -974,7 +974,10 @@ async def start_telegram():
             title = ""
 
         now_hm = _hm()
-        dedupe_sec = int(cfg.get("dedupe_seconds") or 0)
+        # กันพูดซ้ำขั้นต่ำ 90 วินาที สำหรับ "ประกาศเนื้อหาเดียวกันเป๊ะ" เสมอ
+        # (ถึงจะปิดกันซ้ำในเว็บไว้ก็ตาม — กันกรณีประกาศถูกส่งซ้ำ/ลบแล้วส่งใหม่ ซึ่งได้ message id ใหม่
+        #  ทำให้ตัวกันซ้ำระดับข้อความจับไม่ได้ แล้วบอทพูด 2 รอบซ้อน)
+        dedupe_sec = max(int(cfg.get("dedupe_seconds") or 0), 90)
 
         for grp in cfg.get("groups") or []:
             gid = str(grp.get("telegram_group_id") or "").strip()
