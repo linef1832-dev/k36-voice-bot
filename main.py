@@ -721,22 +721,20 @@ async def speak_worker(unit: BotUnit):
                 continue
 
             # สร้างเสียงพูด "ก่อน" เข้าห้อง และใช้ไฟล์ร่วมกันทุกห้องที่ข้อความเหมือนกัน
-            play_path = await _tts_cached(text, voice, rate, unit)
-            if not play_path:
-                await asyncio.sleep(2)
-                play_path = await _tts_cached(text, voice, rate, unit)   # ลองอีกหน (บอทตัวอื่นอาจสร้างสำเร็จแล้ว)
-            if not play_path:
-                print(f"⛔ [{unit.display_name()}] ข้ามห้องนี้ เพราะสร้างเสียงไม่สำเร็จ", flush=True)
-                continue
+            # เริ่มสร้างเสียง "พร้อมกับ" เดินเข้าห้อง แทนที่จะทำทีละอย่าง
+            # (เดิม: สร้างเสียง 2 วิ → แล้วค่อยเข้าห้องอีก 3 วิ = 5 วิ   ตอนนี้ทำคู่กัน = เหลือเท่าตัวที่ช้ากว่า)
+            tts_task = asyncio.create_task(_tts_cached(text, voice, rate, unit))
 
             ch = unit.client.get_channel(room_id)
             if ch is None:
                 try:
                     ch = await unit.client.fetch_channel(room_id)
                 except Exception as e:
+                    tts_task.cancel()
                     print(f"[{unit.display_name()}] หาห้องไม่เจอ {room_id}: {e} (บอทตัวนี้ถูกเชิญเข้าเซิร์ฟเวอร์หรือยัง?)", flush=True)
                     continue
             if not isinstance(ch, (discord.VoiceChannel, discord.StageChannel)):
+                tts_task.cancel()
                 continue
 
             existing = unit.client.voice_clients[0] if unit.client.voice_clients else None
@@ -771,6 +769,22 @@ async def speak_worker(unit: BotUnit):
                 print(f"⚠️ [{unit.display_name()}] เสียงหลุดก่อนพูด — ต่อห้องใหม่", flush=True)
                 vc = await _connect_retry(unit, ch)
                 await _wait_dave_ready(vc)
+
+            # ถึงหน้าห้องแล้ว ค่อยมารับไฟล์เสียงที่สร้างคู่กันไป
+            try:
+                play_path = await tts_task
+            except asyncio.CancelledError:
+                play_path = None
+            if not play_path:
+                await asyncio.sleep(1.5)
+                play_path = await _tts_cached(text, voice, rate, unit)   # ลองอีกหน (บอทตัวอื่นอาจสร้างสำเร็จแล้ว)
+            if not play_path:
+                print(f"⛔ [{unit.display_name()}] ข้ามห้องนี้ เพราะสร้างเสียงไม่สำเร็จ", flush=True)
+                try:
+                    await vc.disconnect(force=True)
+                except Exception:
+                    pass
+                continue
 
             # เสียงเตือน
             if cfg.get("chime_enabled") and CHIME_PATH:
