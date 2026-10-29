@@ -571,7 +571,6 @@ async def _tts_cached(text, voice, rate, unit):
     for k, (pth, ts) in list(_tts_cache.items()):
         if now - ts > 600:
             _tts_cache.pop(k, None)
-            _opus_packets.pop(pth, None)
             for junk in (pth, pth[:-4] + ".mp3"):
                 try:
                     os.remove(junk)
@@ -636,49 +635,6 @@ async def _mp3_to_opus(mp3):
     return None
 
 
-_opus_packets = {}      # path -> [แพ็กเก็ต Opus ที่แกะไว้แล้ว]
-
-
-class MemoryOpusAudio(discord.AudioSource):
-    """เล่นเสียงจากแพ็กเก็ต Opus ที่อยู่ใน RAM ตรงๆ
-    ไม่ต้องเปิด ffmpeg ตอนเล่น (เดิมบอท 7 ตัว = 7 โปรเซส ffmpeg พร้อมกัน
-    ทำให้ CPU แย่งกันแล้วส่งเสียงไม่ทันทุก 20 ms → ได้ยินเป็นกระตุก)"""
-
-    def __init__(self, packets):
-        self._packets = packets
-        self._i = 0
-
-    def is_opus(self):
-        return True
-
-    def read(self):
-        if self._i >= len(self._packets):
-            return b""
-        p = self._packets[self._i]
-        self._i += 1
-        return p
-
-    def cleanup(self):
-        self._packets = []
-
-
-def _load_opus_packets(path):
-    """แกะไฟล์ .ogg เป็นแพ็กเก็ตครั้งเดียว แล้วใช้ซ้ำได้ทุกบอททุกห้อง"""
-    cached = _opus_packets.get(path)
-    if cached is not None:
-        return cached
-    try:
-        from discord.oggparse import OggStream
-        with open(path, "rb") as f:
-            packets = list(OggStream(f).iter_packets())
-        if packets:
-            _opus_packets[path] = packets
-            return packets
-    except Exception as e:
-        print(f"⚠️ แกะไฟล์เสียงไม่ได้ จะใช้ ffmpeg แทน: {type(e).__name__}", flush=True)
-    return None
-
-
 async def _play_file(vc, path):
     while vc.is_playing():
         await asyncio.sleep(0.2)
@@ -689,13 +645,8 @@ async def _play_file(vc, path):
         if e:
             err["e"] = e
         loop.call_soon_threadsafe(done.set)
-    src = None
     if path.endswith(".ogg"):
-        packets = _load_opus_packets(path)
-        if packets:
-            src = MemoryOpusAudio(packets)
-        else:
-            src = discord.FFmpegOpusAudio(path, codec="copy", executable=FFMPEG_EXE)
+        src = discord.FFmpegOpusAudio(path, codec="copy", executable=FFMPEG_EXE)
     else:
         src = discord.FFmpegPCMAudio(path, executable=FFMPEG_EXE)
     vc.play(src, after=_after)
@@ -721,20 +672,22 @@ async def speak_worker(unit: BotUnit):
                 continue
 
             # สร้างเสียงพูด "ก่อน" เข้าห้อง และใช้ไฟล์ร่วมกันทุกห้องที่ข้อความเหมือนกัน
-            # เริ่มสร้างเสียง "พร้อมกับ" เดินเข้าห้อง แทนที่จะทำทีละอย่าง
-            # (เดิม: สร้างเสียง 2 วิ → แล้วค่อยเข้าห้องอีก 3 วิ = 5 วิ   ตอนนี้ทำคู่กัน = เหลือเท่าตัวที่ช้ากว่า)
-            tts_task = asyncio.create_task(_tts_cached(text, voice, rate, unit))
+            play_path = await _tts_cached(text, voice, rate, unit)
+            if not play_path:
+                await asyncio.sleep(2)
+                play_path = await _tts_cached(text, voice, rate, unit)   # ลองอีกหน (บอทตัวอื่นอาจสร้างสำเร็จแล้ว)
+            if not play_path:
+                print(f"⛔ [{unit.display_name()}] ข้ามห้องนี้ เพราะสร้างเสียงไม่สำเร็จ", flush=True)
+                continue
 
             ch = unit.client.get_channel(room_id)
             if ch is None:
                 try:
                     ch = await unit.client.fetch_channel(room_id)
                 except Exception as e:
-                    tts_task.cancel()
                     print(f"[{unit.display_name()}] หาห้องไม่เจอ {room_id}: {e} (บอทตัวนี้ถูกเชิญเข้าเซิร์ฟเวอร์หรือยัง?)", flush=True)
                     continue
             if not isinstance(ch, (discord.VoiceChannel, discord.StageChannel)):
-                tts_task.cancel()
                 continue
 
             existing = unit.client.voice_clients[0] if unit.client.voice_clients else None
@@ -769,22 +722,6 @@ async def speak_worker(unit: BotUnit):
                 print(f"⚠️ [{unit.display_name()}] เสียงหลุดก่อนพูด — ต่อห้องใหม่", flush=True)
                 vc = await _connect_retry(unit, ch)
                 await _wait_dave_ready(vc)
-
-            # ถึงหน้าห้องแล้ว ค่อยมารับไฟล์เสียงที่สร้างคู่กันไป
-            try:
-                play_path = await tts_task
-            except asyncio.CancelledError:
-                play_path = None
-            if not play_path:
-                await asyncio.sleep(1.5)
-                play_path = await _tts_cached(text, voice, rate, unit)   # ลองอีกหน (บอทตัวอื่นอาจสร้างสำเร็จแล้ว)
-            if not play_path:
-                print(f"⛔ [{unit.display_name()}] ข้ามห้องนี้ เพราะสร้างเสียงไม่สำเร็จ", flush=True)
-                try:
-                    await vc.disconnect(force=True)
-                except Exception:
-                    pass
-                continue
 
             # เสียงเตือน
             if cfg.get("chime_enabled") and CHIME_PATH:
