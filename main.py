@@ -943,6 +943,17 @@ async def start_telegram():
         global _last_tg_update, _tg_msg_count
         _last_tg_update = time.time()          # มีสัญญาณชีพจาก Telegram แล้ว
         _tg_msg_count += 1
+
+        # ข้ามข้อความเก่าที่ถูกส่งซ้ำย้อนหลัง
+        # (เวลาบอทต่อ Telegram ใหม่ ระบบจะไล่ส่งอัปเดตที่ตกหล่นมาให้ทั้งหมด
+        #  ถ้าไม่กรอง บอทจะไปพูดประกาศเมื่อหลายชั่วโมงก่อนซ้ำอีกรอบ)
+        try:
+            age = (datetime.now(timezone.utc) - event.message.date).total_seconds()
+        except Exception:
+            age = 0
+        if age > 300:
+            print(f"[ข้ามข้อความเก่า] อายุ {int(age/60)} นาที | {(event.raw_text or '')[:50]}", flush=True)
+            return
         raw = (event.raw_text or "").strip()
         if not raw or not (event.is_group or event.is_channel):
             return
