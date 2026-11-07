@@ -757,8 +757,14 @@ async def speak_worker(unit: BotUnit):
         finally:
             try:
                 # 🌟 ถ้าในคิวตัวเองยังมีงานต่อ ไม่ต้องออกจากห้อง — เดี๋ยว move_to ห้องถัดไปเลย (เร็วกว่า)
-                if vc and vc.is_connected() and unit.queue.empty():
-                    await vc.disconnect(force=True)
+                # ต้องดูจาก voice client จริงของบอท ไม่ใช่ตัวแปร vc ของรอบนี้
+                # (ถ้ารอบนี้หลุดก่อนเข้าห้อง เช่น หาห้องไม่เจอ vc จะเป็น None
+                #  แต่บอทยังค้างอยู่ในห้องจากงานรอบก่อน → กลายเป็นไม่ยอมออกจากห้อง)
+                live = vc if (vc and vc.is_connected()) else None
+                if live is None and unit.client.voice_clients:
+                    live = unit.client.voice_clients[0]
+                if live and live.is_connected() and unit.queue.empty():
+                    await live.disconnect(force=True)
                     print(f"👋 [{unit.display_name()}] ออกจากห้องแล้ว", flush=True)
                     unit.current_room = ""
             except Exception:
@@ -789,6 +795,23 @@ async def telegram_list_loop():
 _last_tg_update = 0.0          # เวลาล่าสุดที่ "มีข้อความจาก Telegram เข้ามาจริง"
 _tg_raw_count = 0              # นับสัญญาณดิบทุกชนิดที่ Telegram ส่งมา
 _tg_msg_count = 0              # นับเฉพาะข้อความในกลุ่มที่บอทอ่านจริง
+
+
+@tasks.loop(seconds=30)
+async def voice_janitor():
+    """กันเหนียว — ถ้าบอทยังอยู่ในห้องทั้งที่คิวว่างและไม่ได้พูดอะไร ให้พาออกมา
+    (กันกรณีงานหลุดกลางคัน แล้วบอทค้างอยู่ในห้องยาว)"""
+    for unit in list(FLEET.values()):
+        try:
+            if not unit.is_ready() or not unit.queue.empty():
+                continue
+            for vc in list(unit.client.voice_clients):
+                if vc.is_connected() and not vc.is_playing():
+                    await vc.disconnect(force=True)
+                    unit.current_room = ""
+                    print(f"🧹 [{unit.display_name()}] ค้างอยู่ในห้องโดยไม่มีงาน — พาออกแล้ว", flush=True)
+        except Exception:
+            pass
 
 
 @tasks.loop(minutes=5)
@@ -1093,6 +1116,7 @@ async def main():
     status_loop.start()
     schedule_loop.start()
     telegram_list_loop.start()
+    voice_janitor.start()
 
     await start_telegram()
     await tg_client.run_until_disconnected()
