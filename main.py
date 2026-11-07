@@ -63,15 +63,37 @@ CHIME_PATH = None  # จะสร้างตอน startup
 # ต้องใช้ discord.py >= 2.7 + แพ็กเกจ davey และต้อง "รอให้ DAVE พร้อม" ก่อนเริ่มเล่นเสียง
 def _check_dave():
     try:
-        import davey  # noqa: F401
-        print(f"✅ discord.py {discord.__version__} + davey (DAVE E2EE) พร้อม", flush=True)
+        import davey
     except Exception:
         print(f"❌ discord.py {discord.__version__} ไม่มี davey — บอทจะเข้าห้องได้แต่เสียงจะเงียบ! "
-              f"แก้ requirements.txt เป็น discord.py[voice]>=2.7.1 แล้ว redeploy", flush=True)
+              f"แก้ requirements.txt เป็น discord.py[voice]==2.7.1 แล้ว redeploy", flush=True)
+        return
+
+    ver = getattr(davey, "__version__", "?")
+    # davey 0.2.0 (2 พ.ย. 2026) เปลี่ยนวิธีสลับกุญแจเข้ารหัส แต่ discord.py 2.7.1 ยังไม่รองรับ
+    # ผลคือบอทเข้าห้องได้ ขึ้นว่ากำลังพูด แต่ไม่มีใครได้ยินเสียงเลย
+    bad = False
+    try:
+        major_minor = tuple(int(x) for x in str(ver).split(".")[:2])
+        bad = major_minor >= (0, 2) and discord.__version__ == "2.7.1"
+    except Exception:
+        pass
+
+    if bad:
+        print("=" * 70, flush=True)
+        print(f"🔇 เตือน! davey {ver} + discord.py {discord.__version__} = เข้าห้องได้แต่ไม่มีเสียง", flush=True)
+        print("   แก้: ใน requirements.txt ใส่  davey>=0.1.7,<0.2  แล้ว redeploy แบบไม่ใช้ cache", flush=True)
+        print("=" * 70, flush=True)
+    else:
+        print(f"✅ discord.py {discord.__version__} + davey {ver} (DAVE E2EE) พร้อม", flush=True)
 
 
-async def _wait_dave_ready(vc, timeout=1.0):
-    """รอให้ voice client ต่อเสร็จ + DAVE session พร้อมเข้ารหัส ก่อนเล่นเสียง (กันพูดแล้วเงียบ)"""
+async def _wait_dave_ready(vc, timeout=10.0, unit=None):
+    """รอให้ voice client ต่อเสร็จ + ระบบเข้ารหัสเสียง (DAVE) พร้อม ก่อนเริ่มพูด
+
+    สำคัญมาก: ถ้าเริ่มพูดก่อนที่การเข้ารหัสจะพร้อม เสียงจะถูกส่งออกไปแบบไม่เข้ารหัส
+    Discord จะทิ้งแพ็กเก็ตนั้นเงียบๆ ไม่มี error — log บอกว่า "พูดแล้ว" แต่ไม่มีใครได้ยิน
+    """
     t0 = time.monotonic()
     while time.monotonic() - t0 < timeout:
         conn = getattr(vc, "_connection", None)
@@ -80,11 +102,16 @@ async def _wait_dave_ready(vc, timeout=1.0):
         if vc.is_connected():
             if can is None:               # discord.py เก่า ไม่มี DAVE
                 return True
-            if can:                       # DAVE พร้อมแล้ว
+            if can:                       # เข้ารหัสพร้อมแล้ว
                 return True
-            if ver == 0 and conn.dave_session is None and time.monotonic() - t0 > 2.0:
-                return True               # ห้องนี้ไม่ใช้ E2EE (เช่น Stage) — ไปต่อได้
+            if ver == 0 and getattr(conn, "dave_session", None) is None and time.monotonic() - t0 > 2.0:
+                return True               # ห้องนี้ไม่ได้ใช้ E2EE — ไปต่อได้
         await asyncio.sleep(0.1)
+    who = f"[{unit.display_name()}] " if unit else ""
+    conn = getattr(vc, "_connection", None)
+    print(f"⚠️ {who}ระบบเข้ารหัสเสียงยังไม่พร้อมใน {timeout:.0f} วิ "
+          f"(ver={getattr(conn, 'dave_protocol_version', '?')} "
+          f"can_encrypt={getattr(conn, 'can_encrypt', '?')}) — เสียงอาจไม่ออก", flush=True)
     return False
 
 
@@ -715,13 +742,29 @@ async def speak_worker(unit: BotUnit):
             print(f"✅ [{unit.display_name()}] เข้าห้อง: {ch.name}", flush=True)
 
             # 🔐 รอให้ DAVE (E2EE) พร้อมก่อนพูด — ถ้าไม่รอ เสียงชุดแรกจะถูกส่งแบบไม่เข้ารหัสแล้วเงียบ
-            await _wait_dave_ready(vc)
+            await _wait_dave_ready(vc, unit=unit)
+
+            # เช็คว่าบอทโดนปิดไมค์ไว้ไหม (ถ้าโดน จะเข้าห้องได้ พูดได้ แต่ไม่มีใครได้ยิน)
+            try:
+                me_vs = ch.guild.me.voice
+                if me_vs is not None and (me_vs.mute or me_vs.suppress):
+                    reason = "โดนปิดไมค์จากเซิร์ฟเวอร์ (Server Mute)" if me_vs.mute else "อยู่ในฐานะผู้ฟังของ Stage (Suppress)"
+                    print(f"🔇 [{unit.display_name()}] {reason} ในห้อง {ch.name} — "
+                          f"พูดไปก็ไม่มีใครได้ยิน ให้ไปคลิกขวาที่บอทในห้องแล้วเอาเครื่องหมาย Server Mute ออก", flush=True)
+                    if me_vs.suppress:
+                        try:
+                            await ch.guild.me.edit(suppress=False)   # ขอขึ้นเป็นผู้พูดใน Stage
+                            print(f"🔈 [{unit.display_name()}] ขอสิทธิ์พูดใน Stage แล้ว", flush=True)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
 
             # เช็คอีกรอบก่อนพูด — ถ้าหลุดระหว่างนี้ให้ต่อใหม่ (กัน 'Not connected to voice')
             if not vc.is_connected():
                 print(f"⚠️ [{unit.display_name()}] เสียงหลุดก่อนพูด — ต่อห้องใหม่", flush=True)
                 vc = await _connect_retry(unit, ch)
-                await _wait_dave_ready(vc)
+                await _wait_dave_ready(vc, unit=unit)
 
             # เสียงเตือน
             if cfg.get("chime_enabled") and CHIME_PATH:
